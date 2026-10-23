@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Trash2, Plus, Key, Check } from 'lucide-react'
 import type { ProviderConfig } from '../electron/preload'
 
-const DEFAULT_PROVIDERS = [
+export const DEFAULT_PROVIDERS = [
   { id: 'deepseek', name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-chat' },
   { id: 'openai', name: 'OpenAI', kind: 'openai-compatible', baseUrl: 'https://api.openai.com/v1', defaultModel: 'gpt-4o-mini' },
   { id: 'anthropic', name: 'Anthropic', kind: 'anthropic', defaultModel: 'claude-3-5-sonnet-20241022' },
@@ -14,6 +14,14 @@ const DEFAULT_PROVIDERS = [
   { id: 'huggingface-local', name: 'Hugging Face (Локально)', kind: 'huggingface-local', local: true, defaultModel: 'Xenova/llama2.c-stories15M' },
 ]
 
+/** Saved providers on top of the built-in ones, so every known provider is selectable. */
+export function mergeProviders(saved: ProviderConfig[]): ProviderConfig[] {
+  const byId = new Map(saved.map((p) => [p.id, p]))
+  const defaults = DEFAULT_PROVIDERS.map((d) => ({ enabled: true, ...d, ...byId.get(d.id) }))
+  const custom = saved.filter((p) => !DEFAULT_PROVIDERS.some((d) => d.id === p.id))
+  return [...defaults, ...custom] as ProviderConfig[]
+}
+
 export default function ProvidersPage({ onBack }: { onBack: () => void }) {
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [editing, setEditing] = useState<string | null>(null)
@@ -24,12 +32,7 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
   }, [])
 
   async function load() {
-    const list = await window.__DSH__.providers.list()
-    // merge with defaults so all known providers appear
-    const byId = new Map(list.map((p: any) => [p.id, p]))
-    const defaults = DEFAULT_PROVIDERS.map((d) => ({ enabled: true, ...d, ...byId.get(d.id) }))
-    const custom = list.filter((p: any) => !DEFAULT_PROVIDERS.some((d) => d.id === p.id))
-    setProviders([...defaults, ...custom] as ProviderConfig[])
+    setProviders(mergeProviders(await window.__DSH__.providers.list()))
   }
 
   const [error, setError] = useState<string | null>(null)

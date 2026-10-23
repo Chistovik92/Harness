@@ -5,7 +5,7 @@ import { useChat } from '@/context/ChatContext'
 import type { ModelInfo } from '../electron/preload'
 import { renderMarkdown } from '@/lib/markdown'
 import SettingsPage from './SettingsPage'
-import ProvidersPage from './ProvidersPage'
+import ProvidersPage, { mergeProviders } from './ProvidersPage'
 import { useUpdate } from '@/context/UpdateContext'
 
 type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number }
@@ -34,11 +34,11 @@ export default function App() {
   // Load providers on mount
   useEffect(() => {
     ;(async () => {
-      const list = await window.__DSH__.providers.list()
+      const list = mergeProviders(await window.__DSH__.providers.list())
       setProviders(list)
-      if (list.length > 0 && !selectedProvider) {
-        const firstEnabled = list.find((p) => p.enabled) ?? list[0]
-        setSelectedProvider(firstEnabled.id)
+      if (!selectedProvider) {
+        const ready = list.find((p) => p.enabled && p.apiKey) ?? list[0]
+        setSelectedProvider(ready.id)
       }
     })().catch((err) => console.error('Failed to load providers:', err))
   }, [selectedProvider, view])
