@@ -10,6 +10,9 @@ on:
         description: 'Existing tag to build and release (e.g. v1.0.0)'
         required: true
 
+permissions:
+  contents: write
+
 env:
   RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
@@ -42,10 +45,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Install rpm tooling
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y rpm
 
       # Older tags declare apps/desktop-app as a root workspace whose lockfile
       # is not committed, and carry a stale package version. Normalise both so
