@@ -14,7 +14,7 @@
     "!**/test/**"
   ],
   "extraMetadata": {
-    "main": "dist/electron/main.js",
+    "main": "dist/electron/electron/main.js",
     "description": "DeepSeek Harness Desktop — AI assistant for DeepSeek, OpenAI, Anthropic, Google, Hugging Face and local models"
   },
   "mac": {

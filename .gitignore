@@ -13,6 +13,9 @@ apps/desktop/.env.windows
 apps/desktop/.env.macos
 apps/desktop-app/.env
 
+# Lockfiles (per-workspace)
+/package-lock.json
+
 # Node
 node_modules/
 .pnpm-store/
@@ -22,6 +25,8 @@ npm-debug.log*
 # TypeScript / tsdown / vite
 lib/
 !apps/desktop-app/src/renderer/lib/
+# Compiled JS artefacts (keep .ts sources only)
+apps/desktop-app/src/renderer/lib/*.js
 dist/
 *.tsbuildinfo
 

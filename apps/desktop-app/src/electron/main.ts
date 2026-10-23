@@ -349,27 +349,35 @@ ipcMain.handle('hf:download', async (_: any, modelId: string) => {
 
 ipcMain.handle('hf:chatLocal', async (_: any, opts: any) => {
   const { model, prompt, temperature = 0.7, maxTokens = 4096, signalId } = opts
-  const controller = new AbortController()
-  activeStreams.set(signalId, controller)
+  const worker = new Worker(path.join(__dirname, 'hf-worker.js'), {
+    workerData: { model, prompt, temperature, maxTokens, streamId: signalId },
+  })
+  hfWorkers.set(signalId, worker)
 
-  // Placeholder for transformers.js worker:
-  // const worker = new Worker(path.join(__dirname, 'hf-worker.js'))
-  // worker.postMessage({ model, prompt, temperature, maxTokens })
-  // worker.on('message', (chunk) => mainWindow?.webContents.send('hf:chunk', { ...chunk, streamId: signalId }))
-  const chunks = ['[локальная модель HF ', model, ' загружена (заглушка)]']
-  for (const c of chunks) {
-    if (controller.signal.aborted) break
-    mainWindow?.webContents.send('hf:chunk', { streamId: signalId, type: 'text', content: c })
-    await new Promise((r) => setTimeout(r, 50))
-  }
-  mainWindow?.webContents.send('hf:chunk', { streamId: signalId, type: 'done' })
-  activeStreams.delete(signalId)
-  return { ok: true }
+  return new Promise<void>((resolve, reject) => {
+    worker.on('message', (msg: any) => {
+      if (msg.type === 'text' || msg.type === 'error' || msg.type === 'done') {
+        mainWindow?.webContents.send('hf:chunk', { streamId: signalId, ...msg })
+      }
+      if (msg.type === 'done') {
+        hfWorkers.delete(signalId)
+        resolve()
+      }
+    })
+    worker.on('error', (err: Error) => {
+      mainWindow?.webContents.send('hf:chunk', { streamId: signalId, type: 'error', error: err.message })
+      hfWorkers.delete(signalId)
+      reject(err)
+    })
+  })
 })
 
 ipcMain.handle('hf:stopLocal', (_: any, signalId: string) => {
-  const ctrl = activeStreams.get(signalId)
-  if (ctrl) ctrl.abort()
+  const w = hfWorkers.get(signalId)
+  if (w) {
+    w.terminate()
+    hfWorkers.delete(signalId)
+  }
 })
 
 // ---- auto-updater ----------------------------------------------------------

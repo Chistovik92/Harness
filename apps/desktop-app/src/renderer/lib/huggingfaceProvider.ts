@@ -49,14 +49,37 @@ export class HuggingFaceProvider extends LLMProvider {
       }
       const prompt = messages.map((m) => `${m.role}: ${m.content}`).join('\n') + '\nassistant:'
       const streamId = crypto.randomUUID()
-      yield* dsh.hf.chatLocal({
-        model,
-        prompt,
-        temperature,
-        maxTokens,
-        signal,
-        streamId,
-      } as any)
+
+      const queue: ChatChunk[] = []
+      let done = false
+      let lastError: string | null = null
+
+      const unsub = dsh.hf.onChunk((chunk: ChatChunk & { streamId: string }) => {
+        if (chunk.streamId !== streamId) return
+        if (chunk.type === 'done') { done = true }
+        else if (chunk.type === 'error') { lastError = chunk.error ?? null; done = true }
+        else queue.push(chunk)
+      })
+
+      try {
+        await dsh.hf.startLocal({ model, prompt, temperature, maxTokens, signalId: streamId })
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err)
+        done = true
+      }
+
+      // Дожидаемся окончания генерации, отдавая чанки из очереди
+      while (!done) {
+        if (queue.length > 0) {
+          yield queue.shift()!
+        } else {
+          await new Promise((r) => setTimeout(r, 10))
+        }
+      }
+
+      if (lastError) yield { type: 'error', error: lastError }
+      yield { type: 'done' }
+      unsub()
       return
     }
 
