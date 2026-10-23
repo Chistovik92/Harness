@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback, useEffect } from 'react'
+import { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react'
 import type { ChatMessage } from '../../electron/preload'
 export type { ChatMessage }
 import {
@@ -16,7 +16,8 @@ type ChatContext = {
   messages: ChatMessage[]
   currentSessionId: string | null
   sessions: StoredSession[]
-  addMessage: (msg: ChatMessage) => void
+  addMessage: (msg: ChatMessage, sessionId?: string) => void
+  persistMessage: (id: string) => void
   setMessages: (msgs: ChatMessage[]) => void
   appendStream: (id: string, chunk: string) => void
   createSession: () => Promise<string>
@@ -58,15 +59,30 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
         const msgs = await getMessages(first.id)
         setMessages(msgs.map(toChat))
       }
-    })()
+    })().catch((err) => console.error('Failed to load chat history:', err))
   }, [])
 
-  const addMessage = useCallback((msg: ChatMessage) => {
+  const messagesRef = useRef<ChatMessage[]>([])
+  messagesRef.current = messages
+  const sessionIdRef = useRef<string | null>(null)
+  sessionIdRef.current = currentSessionId
+
+  const addMessage = useCallback((msg: ChatMessage, sessionId?: string) => {
     setMessages((prev) => [...prev, msg])
-    if (currentSessionId) {
-      dbSaveMessage(toStored(msg, currentSessionId)).catch(console.error)
+    const target = sessionId ?? sessionIdRef.current
+    if (target) {
+      dbSaveMessage(toStored(msg, target)).catch(console.error)
     }
-  }, [currentSessionId])
+  }, [])
+
+  /** Saves the final content of a streamed message once the stream has finished. */
+  const persistMessage = useCallback((id: string) => {
+    const msg = messagesRef.current.find((m) => m.id === id)
+    const target = sessionIdRef.current
+    if (msg && target) {
+      dbSaveMessage(toStored(msg, target)).catch(console.error)
+    }
+  }, [])
 
   const appendStream = useCallback((id: string, chunk: string) => {
     setMessages((prev) =>
@@ -78,6 +94,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     const id = crypto.randomUUID()
     const session: StoredSession = { id, title: 'Новый чат', updatedAt: Date.now() }
     await saveSession(session)
+    sessionIdRef.current = id
     setSessions((prev) => [session, ...prev])
     setCurrentSessionId(id)
     setMessages([])
@@ -107,7 +124,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   }, [currentSessionId, sessions])
 
   return (
-    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
+    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, persistMessage, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
       {children}
     </ChatContext.Provider>
   )

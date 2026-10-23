@@ -68,10 +68,14 @@ export async function deleteSession(id: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(['sessions', 'messages'], 'readwrite')
     tx.objectStore('sessions').delete(id)
-    tx.objectStore('messages').delete(IDBKeyRange.only(id)) // not correct; messages keyed by own id
-    // messages use sessionId index; delete by index below
+    const cursorReq = tx.objectStore('messages').index('sessionId').openCursor(IDBKeyRange.only(id))
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result
+      if (cursor) { cursor.delete(); cursor.continue() }
+    }
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error)
   })
 }
 
@@ -101,22 +105,13 @@ export async function deleteMessagesForSession(sessionId: string): Promise<void>
   const db = await openDB()
   return new Promise((resolve, reject) => {
     const tx = db.transaction('messages', 'readwrite')
-    const store = tx.objectStore('messages')
-    const index = store.index('sessionId')
-    const req = index.getAll(IDBKeyRange.only(sessionId))
-    req.onsuccess = () => {
-      const cursorReq = index.openCursor(IDBKeyRange.only(sessionId))
-      cursorReq.onsuccess = (e: any) => {
-        const cursor = e.target.result
-        if (cursor) {
-          cursor.delete()
-          cursor.continue()
-        } else {
-          resolve()
-        }
-      }
-      cursorReq.onerror = () => reject(cursorReq.error)
+    const cursorReq = tx.objectStore('messages').index('sessionId').openCursor(IDBKeyRange.only(sessionId))
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result
+      if (cursor) { cursor.delete(); cursor.continue() }
     }
-    req.onerror = () => reject(req.error)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error)
   })
 }

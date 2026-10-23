@@ -1,25 +1,28 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Send, Maximize, Minimize, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
+import { Send, Minimize, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
 import { useDsh } from '@/context/DshContext'
 import { useChat } from '@/context/ChatContext'
 import type { ModelInfo } from '../electron/preload'
 import { renderMarkdown } from '@/lib/markdown'
 import SettingsPage from './SettingsPage'
 import ProvidersPage from './ProvidersPage'
+import { useUpdate } from '@/context/UpdateContext'
 
 type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number }
 
 export default function App() {
-  const { apiKey, baseUrl, model, setModel, isConnected, setIsConnected, saveSettings } = useDsh()
-  const { messages, addMessage, appendStream, isLoading, setIsLoading, currentSessionId, createSession, sessions, switchSession, deleteSession, setMessages } = useChat()
+  const { settings, isConnected, setIsConnected } = useDsh()
+  const { messages, addMessage, persistMessage, appendStream, isLoading, setIsLoading, currentSessionId, createSession, sessions, switchSession, deleteSession, setMessages } = useChat()
 
   const [providers, setProviders] = useState<any[]>([])
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [selectedModel, setSelectedModel] = useState<string>('')
-  const [view, setView] = useState<'chat' | 'settings' | 'providers'>('chat')
+  const [view, setView] = useState<'chat' | 'settings' | 'providers'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
+  const { downloaded: updateDownloaded, install: installUpdate } = useUpdate()
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const streamIdRef = useRef<string | null>(null)
   const [input, setInput] = useState('')
   const [streamId, setStreamId] = useState<string | null>(null)
   const abortRef = useRef<(() => void) | null>(null)
@@ -37,117 +40,89 @@ export default function App() {
         const firstEnabled = list.find((p) => p.enabled) ?? list[0]
         setSelectedProvider(firstEnabled.id)
       }
-    })()
-  }, [selectedProvider])
+    })().catch((err) => console.error('Failed to load providers:', err))
+  }, [selectedProvider, view])
 
   useEffect(() => {
     if (selectedProvider) {
       ;(async () => {
         const ms = await window.__DSH__.providers.listModels(selectedProvider)
         setModels(ms)
-        if (ms.length > 0) setSelectedModel(ms[0].id)
-      })()
+        setSelectedModel(ms.length > 0 ? ms[0].id : '')
+      })().catch((err) => console.error('Failed to load models:', err))
     }
   }, [selectedProvider])
 
-  // Listen for chat chunks
-  useEffect(() => {
-    const unsub = window.__DSH__.chat.onChunk((chunk: any) => {
-      if (chunk.streamId !== streamId) return
-      if (chunk.type === 'text' && chunk.content && streamId) appendStream(streamId, chunk.content)
-      if (chunk.type === 'error' && streamId) {
-        appendStream(streamId, `\n\nОшибка: ${chunk.error}`)
-        setIsLoading(false)
-        setStreamId(null)
-        abortRef.current = null
-        setIsConnected(false)
-      }
-      if (chunk.type === 'done' && streamId) {
-        setIsLoading(false)
-        setStreamId(null)
-        abortRef.current = null
-        setIsConnected(false)
-      }
-    })
-    return () => unsub()
-  }, [streamId])
-
-  // Listen for HF local chunks
-  useEffect(() => {
-    const unsub = window.__DSH__.hf.onChunk((chunk: any) => {
-      if (chunk.streamId !== streamId) return
-      if (chunk.type === 'text' && chunk.content && streamId) appendStream(streamId, chunk.content)
-      if (chunk.type === 'error' && streamId) {
-        appendStream(streamId, `\n\nОшибка: ${chunk.error}`)
-        setIsLoading(false)
-        setStreamId(null)
-        abortRef.current = null
-        setIsConnected(false)
-      }
-      if (chunk.type === 'done' && streamId) {
-        setIsLoading(false)
-        setStreamId(null)
-        abortRef.current = null
-        setIsConnected(false)
-      }
-    })
-    return () => unsub()
-  }, [streamId])
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
-  }
-
-  async function sendMessage() {
-    const text = input.trim()
-    if (!text) return
-    if (!selectedProvider) return
-
-    const userMsg: ChatMessage = { id: crypto.randomUUID(), role: 'user', content: text, createdAt: Date.now() }
-    addMessage(userMsg)
-    setInput('')
-    setIsLoading(true)
-
-    const assistantId = crypto.randomUUID()
-    const assistantMsg: ChatMessage = { id: assistantId, role: 'assistant', content: '', createdAt: Date.now() }
-    addMessage(assistantMsg)
-    setStreamId(assistantId)
-    setIsConnected(true)
-
-    const newId = crypto.randomUUID()
-    let streamResult: { cancel: () => void } | null = null
-    abortRef.current = () => { streamResult?.cancel() }
-
-    try {
-      streamResult = await window.__DSH__.chat.stream(selectedProvider, {
-        model: selectedModel,
-        messages: [...messages, userMsg],
-        temperature: 0.7,
-        maxTokens: 4096,
-        signalId: newId,
-      })
-    } catch (err) {
-      appendStream(assistantId, `\n\nОшибка: ${err instanceof Error ? err.message : String(err)}`)
-      setIsLoading(false)
-      setStreamId(null)
-      abortRef.current = null
-      setIsConnected(false)
-    }
-  }
-
-  const cancelMessage = () => {
-    abortRef.current?.()
+  function finishStream(id: string) {
+    persistMessage(id)
+    streamIdRef.current = null
     setIsLoading(false)
     setStreamId(null)
     abortRef.current = null
     setIsConnected(false)
   }
 
+  // Listen for chat chunks (streamIdRef avoids stale closures between renders)
+  useEffect(() => {
+    const unsub = window.__DSH__.chat.onChunk((chunk) => {
+      const id = streamIdRef.current
+      if (!id || chunk.streamId !== id) return
+      if (chunk.type === 'text' && chunk.content) appendStream(id, chunk.content)
+      else if (chunk.type === 'error') {
+        appendStream(id, `\n\nОшибка: ${chunk.error}`)
+        finishStream(id)
+      } else if (chunk.type === 'done') finishStream(id)
+    })
+    return () => unsub()
+  }, [])
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendMessage() }
+  }
+
+  async function sendMessage() {
+    const text = input.trim()
+    if (!text || !selectedProvider || !selectedModel || isLoading) return
+
+    const sessionId = currentSessionId ?? await createSession()
+    const userMsg: ChatMessage = { id: crypto.randomUUID(), role: 'user', content: text, createdAt: Date.now() }
+    const assistantId = crypto.randomUUID()
+    const history = [...messages, userMsg].map((m) => ({ role: m.role, content: m.content }))
+
+    addMessage(userMsg, sessionId)
+    addMessage({ id: assistantId, role: 'assistant', content: '', createdAt: Date.now() }, sessionId)
+    setInput('')
+    setIsLoading(true)
+    setIsConnected(true)
+    // The assistant message id doubles as the stream id so chunks route to it.
+    streamIdRef.current = assistantId
+    setStreamId(assistantId)
+
+    try {
+      const stream = window.__DSH__.chat.stream(selectedProvider, {
+        model: selectedModel,
+        messages: history,
+        temperature: settings.temperature ?? 0.7,
+        maxTokens: settings.maxTokens ?? 4096,
+        signalId: assistantId,
+      })
+      abortRef.current = stream.cancel
+      await stream.done
+    } catch (err) {
+      if (streamIdRef.current === assistantId) {
+        appendStream(assistantId, `\n\nОшибка: ${err instanceof Error ? err.message : String(err)}`)
+        finishStream(assistantId)
+      }
+    }
+  }
+
+  const cancelMessage = () => {
+    abortRef.current?.()
+  }
+
   const newSession = () => {
     setInput('')
-    setMessages([])
-    setStreamId(null)
-    createSession()
+    createSession().catch((err) => console.error('Failed to create session:', err))
   }
 
   if (view === 'settings') {
@@ -175,7 +150,8 @@ export default function App() {
   }
 
   const currentProvider = providers.find((p) => p.id === selectedProvider)
-  const providerNeedsKey = currentProvider?.requiresKey !== false && !(currentProvider?.apiKey)
+  const isLocalProvider = currentProvider?.local === true || currentProvider?.kind === 'huggingface-local'
+  const providerNeedsKey = !isLocalProvider && currentProvider?.requiresKey !== false && !(currentProvider?.apiKey)
 
   return (
     <div className="h-screen flex flex-col bg-slate-900 text-slate-100 overflow-hidden">
@@ -186,12 +162,16 @@ export default function App() {
         </div>
         <div className="flex items-center gap-1">
           <button onClick={() => window.__DSH__.window.minimize()} className="w-7 h-7 rounded hover:bg-slate-800 flex items-center justify-center text-slate-400 hover:text-white"><Minimize className="w-3 h-3" /></button>
-          {process.platform !== 'darwin' && (
-            <button className="w-7 h-7 rounded hover:bg-slate-800 flex items-center justify-center text-slate-400 hover:text-white"><Maximize className="w-3 h-3" /></button>
-          )}
           <button onClick={() => window.__DSH__.window.quit()} className="w-7 h-7 rounded hover:bg-red-900/50 flex items-center justify-center text-slate-400 hover:text-white"><X className="w-3 h-3" /></button>
         </div>
       </div>
+
+      {updateDownloaded && (
+        <div className="flex items-center justify-between px-4 py-1.5 bg-indigo-900/40 border-b border-indigo-700/50 text-xs text-indigo-100 shrink-0">
+          <span>Доступна новая версия — перезапустите приложение для обновления.</span>
+          <button onClick={installUpdate} className="px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white">Перезапустить</button>
+        </div>
+      )}
 
       <div className="flex-1 flex overflow-hidden">
         <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
@@ -235,12 +215,13 @@ export default function App() {
             <label className="block px-3 py-1 text-xs font-semibold text-slate-500 uppercase">Сессии</label>
             <div className="space-y-1">
               {sessions.map((s: any) => (
-                <button key={s.id} onClick={() => switchSession(s.id)}
+                <div key={s.id} role="button" tabIndex={0} onClick={() => switchSession(s.id)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') switchSession(s.id) }}
                   className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-left transition-colors ${currentSessionId === s.id ? 'bg-indigo-600/20 text-indigo-200 border border-indigo-500/30' : 'hover:bg-slate-800 text-slate-300'}`}>
                   <Clock className="w-3.5 h-3.5 opacity-50" />
                   <span className="truncate">{s.title}</span>
-                  <button onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }} className="ml-auto opacity-0 hover:opacity-100 p-1 text-slate-500 hover:text-red-400"><X className="w-3 h-3" /></button>
-                </button>
+                  <button onClick={(e) => { e.stopPropagation(); deleteSession(s.id) }} aria-label="Удалить сессию" className="ml-auto opacity-50 hover:opacity-100 p-1 text-slate-500 hover:text-red-400"><X className="w-3 h-3" /></button>
+                </div>
               ))}
               {sessions.length === 0 && <div className="px-3 py-2 text-xs text-slate-500">Сессий пока нет</div>}
             </div>
@@ -274,7 +255,6 @@ export default function App() {
             <div className="max-w-3xl mx-auto">
               <div className="flex gap-2">
                 <input
-                  ref={messagesEndRef as unknown as React.RefObject<HTMLInputElement>}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}

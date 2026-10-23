@@ -17,7 +17,7 @@
 | **История чатов** | Сессии и сообщения сохраняются локально (IndexedDB), доступны после перезапуска |
 | **Маркдаун + код** | Отрисовка сообщений с подсветкой кода, формулами и вложениями |
 | **Автообновление** | Проверка и установка новых версий через `electron-updater` |
-| **Установщики** | Windows (NSIS `.exe`), macOS (`.dmg` / `.zip`), Linux (`.AppImage` / `.deb` / `.rpm`) |
+| **Установщики** | Windows (NSIS `.exe`), macOS (`.dmg` / `.zip`), Linux (`.AppImage` / `.deb`) |
 
 ---
 
@@ -138,7 +138,7 @@ apps/desktop-app/
 
 - **Windows** — NSIS инсталятор `.exe` (подпись EV-сертификатом, опционально)
 - **macOS** — `.dmg` + `.zip` (Apple Silicon arm64 + Intel x64, нотаризация Apple)
-- **Linux** — `.AppImage`, `.deb`, `.rpm`
+- **Linux** — `.AppImage`, `.deb`
 
 Артефакты публикуются на [GitHub Releases](https://github.com/Chistovik92/Harness/releases) при создании тега `v*`.
 

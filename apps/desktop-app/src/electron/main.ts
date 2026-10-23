@@ -2,47 +2,111 @@
  * DeepSeek Harness Desktop — Electron main process.
  *
  * - Application lifecycle, windows, tray, auto-updater
- * - Encrypted local storage of provider API keys (AES-256-GCM, key in userData)
+ * - Encrypted local storage of provider API keys (AES-256-GCM; the key itself
+ *   is protected by the OS keychain through Electron safeStorage when available)
  * - Provider registry + chat streaming (OpenAI-compatible, Anthropic, Google, HF API/local)
- * - Local HuggingFace models via transformers.js worker thread
+ * - Local HuggingFace models via a transformers.js worker thread
  */
 
-import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, shell, screen } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, shell, screen, safeStorage, nativeImage } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 
-import { Worker } from 'node:worker_threads'
 import { OpenAICompatibleProvider } from '../renderer/lib/openaiProvider'
 import { AnthropicProvider } from '../renderer/lib/anthropicProvider'
 import { GoogleProvider } from '../renderer/lib/googleProvider'
 import { HuggingFaceProvider } from '../renderer/lib/huggingfaceProvider'
-
-// ---- providers ------------------------------------------------------------
 import { providerRegistry } from '../renderer/lib/registry'
+import type { LLMProvider, ProviderKind, Message, ChatChunk } from '../renderer/lib/providers'
+import { encrypt, decrypt, generateKey, isValidKey } from './secureStore'
+import { runLocalModel, isValidModelId } from './localHf'
 
-providerRegistry.register('deepseek', new OpenAICompatibleProvider({ id: 'deepseek', name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-chat', enabled: true }))
-providerRegistry.register('openai', new OpenAICompatibleProvider({ id: 'openai', name: 'OpenAI', kind: 'openai-compatible', baseUrl: 'https://api.openai.com/v1', defaultModel: 'gpt-4o-mini', enabled: true }))
-providerRegistry.register('groq', new OpenAICompatibleProvider({ id: 'groq', name: 'Groq', kind: 'openai-compatible', baseUrl: 'https://api.groq.com/openai/v1', defaultModel: 'llama-3.1-70b-versatile', enabled: true }))
-providerRegistry.register('together', new OpenAICompatibleProvider({ id: 'together', name: 'Together AI', kind: 'openai-compatible', baseUrl: 'https://api.together.xyz/v1', defaultModel: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo', enabled: true }))
-providerRegistry.register('openrouter', new OpenAICompatibleProvider({ id: 'openrouter', name: 'OpenRouter', kind: 'openai-compatible', baseUrl: 'https://openrouter.ai/api/v1', defaultModel: 'deepseek/deepseek-chat', enabled: true }))
+// ---- providers -------------------------------------------------------------
+type StoredProvider = {
+  id: string; name: string; kind: ProviderKind
+  apiKey?: string; baseUrl?: string; defaultModel?: string
+  enabled: boolean; local?: boolean
+}
+
+const PROVIDER_KINDS: ProviderKind[] = ['openai-compatible', 'anthropic', 'google', 'huggingface-api', 'huggingface-local']
+
+function oai(id: string, name: string, baseUrl: string, defaultModel: string) {
+  providerRegistry.register(id, new OpenAICompatibleProvider({ id, name, kind: 'openai-compatible', baseUrl, defaultModel, enabled: true }))
+}
+oai('deepseek', 'DeepSeek', 'https://api.deepseek.com/v1', 'deepseek-chat')
+oai('openai', 'OpenAI', 'https://api.openai.com/v1', 'gpt-4o-mini')
+oai('groq', 'Groq', 'https://api.groq.com/openai/v1', 'llama-3.1-70b-versatile')
+oai('together', 'Together AI', 'https://api.together.xyz/v1', 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo')
+oai('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', 'deepseek/deepseek-chat')
 providerRegistry.register('anthropic', new AnthropicProvider({ id: 'anthropic', name: 'Anthropic', kind: 'anthropic', defaultModel: 'claude-3-5-sonnet-20241022', enabled: true }))
 providerRegistry.register('google', new GoogleProvider({ id: 'google', name: 'Google', kind: 'google', defaultModel: 'gemini-1.5-flash', enabled: true }))
 providerRegistry.register('huggingface-api', new HuggingFaceProvider({ id: 'huggingface-api', name: 'Hugging Face (API)', kind: 'huggingface-api', defaultModel: 'meta-llama/Meta-Llama-3.1-8B-Instruct', enabled: true }))
 providerRegistry.register('huggingface-local', new HuggingFaceProvider({ id: 'huggingface-local', name: 'Hugging Face (Local)', kind: 'huggingface-local', local: true, defaultModel: 'Xenova/llama2.c-stories15M', enabled: true }))
 
+/** Built-in provider by id, or an instance created from a user-defined config. */
+function resolveProvider(cfg: StoredProvider): LLMProvider | undefined {
+  const known = providerRegistry.get(cfg.id)
+  if (known) return known
+  switch (cfg.kind) {
+    case 'openai-compatible': return new OpenAICompatibleProvider(cfg)
+    case 'anthropic': return new AnthropicProvider(cfg)
+    case 'google': return new GoogleProvider(cfg)
+    case 'huggingface-api': return new HuggingFaceProvider(cfg)
+    case 'huggingface-local': return new HuggingFaceProvider({ ...cfg, local: true })
+    default: return undefined
+  }
+}
+
+const isLocalHf = (cfg: StoredProvider) => cfg.kind === 'huggingface-local' || cfg.local === true
+
 // ---- paths -----------------------------------------------------------------
-const IS_DEV = process.env.NODE_ENV === 'development' || !process.env.APP_IS_PACKAGED
+const IS_DEV = !app.isPackaged
 const USER_DATA = app.getPath('userData')
 const STORAGE_KEY_PATH = path.join(USER_DATA, '.storage_key')
 const PROVIDERS_PATH = path.join(USER_DATA, 'providers.enc.json')
+const SETTINGS_PATH = path.join(USER_DATA, 'settings.json')
 const HF_CACHE = path.join(USER_DATA, 'hf-cache')
+const DEV_URL = 'http://127.0.0.1:5173'
+// __dirname is <app>/dist/electron/electron
+const RENDERER_INDEX = path.join(__dirname, '..', '..', 'renderer', 'index.html')
+const RESOURCES_DIR = path.join(app.getAppPath(), 'resources')
+const ICON_PATH = path.join(RESOURCES_DIR, 'icon.png')
 
 // ---- windows ---------------------------------------------------------------
 let mainWindow: BrowserWindow | null = null
-let tray: Tray | null = null
 let settingsWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+let isQuitting = false
 
 const activeStreams = new Map<string, AbortController>()
+
+function isAppUrl(url: string): boolean {
+  return IS_DEV ? url.startsWith(DEV_URL) : url.startsWith('file://')
+}
+
+function hardenWebContents(win: BrowserWindow) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+    return { action: 'deny' }
+  })
+  win.webContents.on('will-navigate', (event, url) => {
+    if (isAppUrl(url)) return
+    event.preventDefault()
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+  })
+}
+
+const webPreferences = () => ({
+  preload: path.join(__dirname, 'preload.js'),
+  contextIsolation: true,
+  nodeIntegration: false,
+  sandbox: true,
+})
+
+function loadRenderer(win: BrowserWindow, hash = '') {
+  if (IS_DEV) void win.loadURL(`${DEV_URL}${hash ? `/#${hash}` : ''}`)
+  else void win.loadFile(RENDERER_INDEX, hash ? { hash } : undefined)
+}
 
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize
@@ -52,25 +116,18 @@ function createWindow() {
     height: Math.min(800, height),
     minWidth: 900,
     minHeight: 600,
-    show: IS_DEV,
+    show: false,
     autoHideMenuBar: !IS_DEV,
-    icon: path.join(__dirname, '..', 'resources', 'icon.png'),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
+    icon: ICON_PATH,
+    webPreferences: webPreferences(),
   })
-
-  if (IS_DEV) {
-    mainWindow.loadURL('http://127.0.0.1:5173')
-    mainWindow.webContents.openDevTools()
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'))
-  }
+  hardenWebContents(mainWindow)
+  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  loadRenderer(mainWindow)
+  if (IS_DEV) mainWindow.webContents.openDevTools()
 
   mainWindow.on('close', (event) => {
-    if (process.platform !== 'darwin') {
+    if (!isQuitting && process.platform !== 'darwin') {
       event.preventDefault()
       mainWindow?.hide()
     }
@@ -79,32 +136,39 @@ function createWindow() {
 }
 
 function createSettingsWindow() {
-  if (settingsWindow) { settingsWindow.focus(); return }
+  if (settingsWindow && !settingsWindow.isDestroyed()) { settingsWindow.focus(); return }
   settingsWindow = new BrowserWindow({
     title: 'Настройки — DeepSeek Harness',
     width: 700, height: 560, minWidth: 600, minHeight: 480,
-    modal: true, parent: mainWindow || undefined,
-    icon: path.join(__dirname, '..', 'resources', 'icon.png'),
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+    modal: Boolean(mainWindow), parent: mainWindow ?? undefined,
+    icon: ICON_PATH,
+    webPreferences: webPreferences(),
   })
-  const url = IS_DEV ? 'http://127.0.0.1:5173/#/settings' : `file://${path.join(__dirname, '..', 'dist', 'renderer', 'index.html')}#/settings`
-  settingsWindow.loadURL(url)
+  hardenWebContents(settingsWindow)
+  loadRenderer(settingsWindow, '/settings')
   settingsWindow.on('closed', () => { settingsWindow = null })
 }
 
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow()
+  else { mainWindow.show(); mainWindow.focus() }
+}
+
 function createTray() {
-  const iconPath = path.join(__dirname, '..', 'resources', 'tray.png')
-  const { nativeImage } = require('electron')
-  const icon = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : null
-  tray = new Tray(icon || undefined)
-  tray.setToolTip('DeepSeek Harness')
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Открыть DeepSeek Harness', click: () => mainWindow?.show() },
-    { label: 'Настройки', click: createSettingsWindow },
-    { type: 'separator' },
-    { label: 'Выйти', click: () => app.quit() },
-  ]))
-  tray.on('click', () => mainWindow?.show())
+  try {
+    const icon = fs.existsSync(ICON_PATH) ? nativeImage.createFromPath(ICON_PATH).resize({ width: 16, height: 16 }) : nativeImage.createEmpty()
+    tray = new Tray(icon)
+    tray.setToolTip('DeepSeek Harness')
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Открыть DeepSeek Harness', click: showMainWindow },
+      { label: 'Настройки', click: createSettingsWindow },
+      { type: 'separator' },
+      { label: 'Выйти', click: () => app.quit() },
+    ]))
+    tray.on('click', showMainWindow)
+  } catch (err) {
+    console.error('Tray unavailable:', err)
+  }
 }
 
 function createMenu() {
@@ -123,10 +187,11 @@ function createMenu() {
       { label: 'Вырезать', role: 'cut' },
       { label: 'Копировать', role: 'copy' },
       { label: 'Вставить', role: 'paste' },
+      { label: 'Выделить всё', role: 'selectAll' },
     ]},
     { label: 'Вид', submenu: [
       { label: 'Перезагрузить', role: 'reload' },
-      { label: 'Инструменты разработчика', role: 'toggleDevTools' },
+      ...(IS_DEV ? [{ label: 'Инструменты разработчика', role: 'toggleDevTools' } as Electron.MenuItemConstructorOptions] : []),
       { type: 'separator' },
       { label: 'Увеличить', role: 'zoomIn' },
       { label: 'Уменьшить', role: 'zoomOut' },
@@ -138,267 +203,348 @@ function createMenu() {
       { label: 'Всегда поверх', type: 'checkbox', checked: false, click: (item) => mainWindow?.setAlwaysOnTop(item.checked) },
     ]},
     { label: 'Помощь', submenu: [
-      { label: 'GitHub', click: () => shell.openExternal('https://github.com/Chistovik92/Harness') },
+      { label: 'GitHub', click: () => { void shell.openExternal('https://github.com/Chistovik92/Harness') } },
     ]},
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
 // ---- encrypted storage -----------------------------------------------------
-const ALGORITHM = 'aes-256-gcm'
-
-import { createRequire } from 'node:module'
-const _require = createRequire(import.meta.url)
-// @ts-ignore — Node crypto in Electron main (runtime), bypass DOM-lib type conflicts
-const nc: any = _require('crypto')
-
-function b64enc(bytes: Uint8Array | number[]): string {
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
-  let bin = ''
-  for (const b of arr) bin += String.fromCharCode(b)
-  return btoa(bin)
-}
-
-function b64dec(str: string): Uint8Array {
-  const bin = atob(str)
-  const bytes = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-  return bytes
-}
+const KEY_PREFIX_OS = 'os:'
+const KEY_PREFIX_RAW = 'raw:'
 
 async function getOrCreateStorageKey(): Promise<Buffer> {
   if (fs.existsSync(STORAGE_KEY_PATH)) {
-    const raw = await fs.promises.readFile(STORAGE_KEY_PATH, 'utf-8')
-    return b64dec(raw) as unknown as Buffer
+    try {
+      const stored = (await fs.promises.readFile(STORAGE_KEY_PATH, 'utf-8')).trim()
+      const key = stored.startsWith(KEY_PREFIX_OS)
+        ? Buffer.from(safeStorage.decryptString(Buffer.from(stored.slice(KEY_PREFIX_OS.length), 'base64')), 'base64')
+        : Buffer.from(stored.replace(KEY_PREFIX_RAW, ''), 'base64')
+      if (isValidKey(key)) return key
+    } catch (err) {
+      console.error('Storage key unreadable, regenerating:', err)
+    }
+    await fs.promises.rename(STORAGE_KEY_PATH, `${STORAGE_KEY_PATH}.invalid-${Date.now()}`).catch(() => {})
   }
-  const key = nc.randomBytes(32)
-  await fs.promises.writeFile(STORAGE_KEY_PATH, b64enc(key as unknown as Uint8Array), { mode: 0o600 })
+  const key = generateKey()
+  const b64 = key.toString('base64')
+  const serialized = safeStorage.isEncryptionAvailable()
+    ? KEY_PREFIX_OS + safeStorage.encryptString(b64).toString('base64')
+    : KEY_PREFIX_RAW + b64
+  await fs.promises.writeFile(STORAGE_KEY_PATH, serialized, { mode: 0o600 })
   return key
-}
-
-async function encrypt(text: string, key: Buffer): Promise<string> {
-  const iv = nc.randomBytes(12)
-  const cipher = nc.createCipheriv(ALGORITHM, key, iv)
-  let encrypted = cipher.update(text, 'utf8')
-  encrypted = Buffer.concat([encrypted, cipher.final()])
-  return b64enc(iv) + ':' + b64enc(Array.from(encrypted))
-}
-
-async function decrypt(payload: string, key: Buffer): Promise<string> {
-  const [ivB64, ctB64] = payload.split(':')
-  const decipher = nc.createDecipheriv(ALGORITHM, key, b64dec(ivB64))
-  let decrypted = decipher.update(b64dec(ctB64))
-  decrypted = Buffer.concat([decrypted, decipher.final()])
-  return decrypted.toString('utf-8')
 }
 
 let storageKeyPromise: Promise<Buffer> | null = null
 function storageKey(): Promise<Buffer> {
-  if (!storageKeyPromise) storageKeyPromise = getOrCreateStorageKey()
+  storageKeyPromise ??= getOrCreateStorageKey().catch((err) => { storageKeyPromise = null; throw err })
   return storageKeyPromise
 }
 
-async function readProviders(): Promise<any[]> {
+async function readProviders(): Promise<StoredProvider[]> {
+  if (!fs.existsSync(PROVIDERS_PATH)) return []
   try {
-    if (!fs.existsSync(PROVIDERS_PATH)) return []
-    const key = await storageKey()
     const raw = await fs.promises.readFile(PROVIDERS_PATH, 'utf-8')
-    const decrypted = await decrypt(raw, key)
-    return JSON.parse(decrypted)
-  } catch {
+    const parsed = JSON.parse(decrypt(raw, await storageKey()))
+    return Array.isArray(parsed) ? parsed : []
+  } catch (err) {
+    // Keep the unreadable file for manual recovery instead of silently overwriting it later.
+    console.error('Provider store unreadable, moving aside:', err)
+    await fs.promises.rename(PROVIDERS_PATH, `${PROVIDERS_PATH}.corrupt-${Date.now()}`).catch(() => {})
     return []
   }
 }
 
-async function writeProviders(providers: any[]): Promise<void> {
-  const key = await storageKey()
-  const encrypted = await encrypt(JSON.stringify(providers), key)
-  await fs.promises.writeFile(PROVIDERS_PATH, encrypted, { mode: 0o600 })
+async function writeProviders(providers: StoredProvider[]): Promise<void> {
+  const encrypted = encrypt(JSON.stringify(providers), await storageKey())
+  const tmp = `${PROVIDERS_PATH}.tmp`
+  await fs.promises.writeFile(tmp, encrypted, { mode: 0o600 })
+  await fs.promises.rename(tmp, PROVIDERS_PATH)
+}
+
+// Serialise read-modify-write cycles so concurrent IPC calls cannot lose updates.
+let providerQueue: Promise<unknown> = Promise.resolve()
+function mutateProviders<T>(fn: (list: StoredProvider[]) => { list: StoredProvider[]; result: T }): Promise<T> {
+  const run = providerQueue.then(async () => {
+    const { list, result } = fn(await readProviders())
+    await writeProviders(list)
+    return result
+  })
+  providerQueue = run.catch(() => {})
+  return run
+}
+
+// ---- validation ------------------------------------------------------------
+const isHttpUrl = (v: string) => { try { return /^https?:$/.test(new URL(v).protocol) } catch { return false } }
+const str = (v: unknown, max: number): string | undefined => (typeof v === 'string' && v.length > 0 ? v.slice(0, max) : undefined)
+const clamp = (v: unknown, min: number, max: number, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback)
+
+function parseProvider(raw: any): StoredProvider {
+  const id = str(raw?.id, 100)
+  const name = str(raw?.name, 100)
+  if (!id || !name) throw new Error('Provider id and name are required')
+  if (!PROVIDER_KINDS.includes(raw.kind)) throw new Error(`Unsupported provider kind: ${String(raw.kind)}`)
+  const baseUrl = str(raw.baseUrl, 500)
+  if (baseUrl && !isHttpUrl(baseUrl)) throw new Error('Base URL must be an http(s) URL')
+  return {
+    id, name, kind: raw.kind,
+    apiKey: str(raw.apiKey, 500), baseUrl, defaultModel: str(raw.defaultModel, 200),
+    enabled: raw.enabled !== false,
+    ...(raw.local === true || raw.kind === 'huggingface-local' ? { local: true } : {}),
+  }
 }
 
 // ---- settings persistence --------------------------------------------------
 type Settings = { apiKey?: string; baseUrl?: string; model?: string; temperature?: number; maxTokens?: number; theme?: 'light' | 'dark'; fontSize?: number }
-const SETTINGS_PATH = path.join(USER_DATA, 'settings.json')
 const DEFAULT_SETTINGS: Settings = { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', temperature: 0.7, maxTokens: 4096, theme: 'dark', fontSize: 14 }
+const DEEPSEEK_ID = 'deepseek'
 
-function loadSettings(): Settings {
-  try { if (fs.existsSync(SETTINGS_PATH)) return { ...DEFAULT_SETTINGS, ...JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8')) } } catch {}
-  return { ...DEFAULT_SETTINGS }
-}
-function saveSettings(settings: Partial<Settings>): Settings {
-  const current = loadSettings()
-  const next = { ...current, ...settings }
-  fs.writeFileSync(SETTINGS_PATH, JSON.stringify(next, null, 2))
-  return next
+function readSettingsFile(): Settings {
+  try {
+    if (fs.existsSync(SETTINGS_PATH)) return JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf-8')) as Settings
+  } catch (err) {
+    console.error('settings.json unreadable, using defaults:', err)
+  }
+  return {}
 }
 
-// ---- IPC -------------------------------------------------------------------
-ipcMain.handle('app:getPath', (_: any, name: string) => { try { return app.getPath(name as any) } catch { return null } })
+function writeSettingsFile(settings: Settings) {
+  const tmp = `${SETTINGS_PATH}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(settings, null, 2))
+  fs.renameSync(tmp, SETTINGS_PATH)
+}
+
+/** The DeepSeek API key lives in the encrypted store, never in settings.json. */
+async function setDeepseekKey(apiKey: string | undefined): Promise<void> {
+  await mutateProviders((list) => {
+    const idx = list.findIndex((p) => p.id === DEEPSEEK_ID)
+    const base: StoredProvider = idx >= 0 ? list[idx] : { id: DEEPSEEK_ID, name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-chat', enabled: true }
+    const next = { ...base, apiKey }
+    return { list: idx >= 0 ? list.map((p, i) => (i === idx ? next : p)) : [...list, next], result: undefined }
+  })
+}
+
+async function loadSettings(): Promise<Settings> {
+  const file = readSettingsFile()
+  if (typeof file.apiKey === 'string' && file.apiKey) {
+    // Migrate legacy plaintext key into the encrypted store.
+    await setDeepseekKey(file.apiKey)
+    const { apiKey: _legacy, ...rest } = file
+    writeSettingsFile(rest)
+    Object.assign(file, rest)
+  }
+  const providers = await readProviders()
+  return { ...DEFAULT_SETTINGS, ...file, apiKey: providers.find((p) => p.id === DEEPSEEK_ID)?.apiKey }
+}
+
+async function saveSettings(raw: any): Promise<Settings> {
+  const baseUrl = str(raw?.baseUrl, 500)
+  if (baseUrl && !isHttpUrl(baseUrl)) throw new Error('Base URL must be an http(s) URL')
+  const { apiKey: _ignored, ...current } = readSettingsFile()
+  const next: Settings = {
+    ...current,
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+    ...(str(raw?.model, 200) ? { model: str(raw.model, 200) } : {}),
+    ...(raw?.temperature !== undefined ? { temperature: clamp(raw.temperature, 0, 2, 0.7) } : {}),
+    ...(raw?.maxTokens !== undefined ? { maxTokens: Math.round(clamp(raw.maxTokens, 1, 131072, 4096)) } : {}),
+    ...(raw?.theme === 'light' || raw?.theme === 'dark' ? { theme: raw.theme } : {}),
+    ...(raw?.fontSize !== undefined ? { fontSize: Math.round(clamp(raw.fontSize, 8, 32, 14)) } : {}),
+  }
+  writeSettingsFile(next)
+  if (raw && 'apiKey' in raw) await setDeepseekKey(str(raw.apiKey, 500))
+  return loadSettings()
+}
+
+// ---- IPC: app / settings / providers ---------------------------------------
+const PATH_NAMES = new Set(['userData', 'documents', 'downloads', 'desktop', 'home', 'temp'])
+
+ipcMain.handle('app:getPath', (_e, name: string) => (PATH_NAMES.has(name) ? app.getPath(name as 'userData') : null))
 ipcMain.handle('app:getVersion', () => app.getVersion())
-ipcMain.handle('app:isPackaged', () => process.env.APP_IS_PACKAGED === 'true' || !IS_DEV)
+ipcMain.handle('app:isPackaged', () => app.isPackaged)
 
 ipcMain.handle('settings:get', () => loadSettings())
-ipcMain.handle('settings:set', (_: any, settings: Partial<Settings>) => saveSettings(settings))
+ipcMain.handle('settings:set', (_e, settings) => saveSettings(settings))
 
-ipcMain.handle('providers:list', async () => readProviders())
-ipcMain.handle('providers:get', async (_: any, id: string) => {
-  const list = await readProviders()
-  return list.find((p) => p.id === id) ?? null
+ipcMain.handle('providers:list', () => readProviders())
+ipcMain.handle('providers:get', async (_e, id: string) => (await readProviders()).find((p) => p.id === id) ?? null)
+ipcMain.handle('providers:set', async (_e, raw) => {
+  const config = parseProvider(raw)
+  await mutateProviders((list) => {
+    const idx = list.findIndex((p) => p.id === config.id)
+    return { list: idx >= 0 ? list.map((p, i) => (i === idx ? config : p)) : [...list, config], result: undefined }
+  })
 })
-ipcMain.handle('providers:set', async (_: any, config: any) => {
-  const list = await readProviders()
-  const idx = list.findIndex((p) => p.id === config.id)
-  if (idx >= 0) list[idx] = config
-  else list.push(config)
-  await writeProviders(list)
-  return config
-})
-ipcMain.handle('providers:remove', async (_: any, id: string) => {
-  const list = await readProviders()
-  const filtered = list.filter((p) => p.id !== id)
-  await writeProviders(filtered)
-})
-ipcMain.handle('providers:listModels', async (_: any, providerId: string) => {
-  const p = providerRegistry.get(providerId)
-  if (!p) return []
-  const list = await readProviders()
-  const cfg = list.find((x: any) => x.id === providerId)
-  return p.listModels({
-    id: p.id, name: p.name, kind: p.kind,
-    apiKey: cfg?.apiKey, baseUrl: cfg?.baseUrl, defaultModel: cfg?.defaultModel, enabled: !!cfg?.enabled, local: cfg?.local,
-  } as any)
+ipcMain.handle('providers:remove', (_e, id: string) =>
+  mutateProviders((list) => ({ list: list.filter((p) => p.id !== id), result: undefined })))
+ipcMain.handle('providers:listModels', async (_e, providerId: string) => {
+  const cfg = (await readProviders()).find((x) => x.id === providerId)
+  const provider = cfg ? resolveProvider(cfg) : providerRegistry.get(providerId)
+  if (!provider) return []
+  return provider.listModels({
+    id: provider.id, name: provider.name, kind: provider.kind,
+    apiKey: cfg?.apiKey, baseUrl: cfg?.baseUrl, defaultModel: cfg?.defaultModel, enabled: cfg?.enabled !== false,
+  })
 })
 
 ipcMain.handle('dialog:openFile', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openFile', 'multiSelections'], filters: [{ name: 'Документы', extensions: ['txt','md','py','js','ts','json','csv','log'] }, { name: 'Все файлы', extensions: ['*'] }] })
+  const options: Electron.OpenDialogOptions = { properties: ['openFile', 'multiSelections'], filters: [{ name: 'Документы', extensions: ['txt', 'md', 'py', 'js', 'ts', 'json', 'csv', 'log'] }, { name: 'Все файлы', extensions: ['*'] }] }
+  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options)
   return result.filePaths
 })
-ipcMain.handle('dialog:saveFile', async (_: any, defaultName: string) => {
-  const result = await dialog.showSaveDialog(mainWindow!, { defaultPath: defaultName, filters: [{ name: 'Markdown', extensions: ['md'] }, { name: 'Текст', extensions: ['txt'] }] })
+ipcMain.handle('dialog:saveFile', async (_e, defaultName: string) => {
+  const options: Electron.SaveDialogOptions = { defaultPath: str(defaultName, 255), filters: [{ name: 'Markdown', extensions: ['md'] }, { name: 'Текст', extensions: ['txt'] }] }
+  const result = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options)
   return result.filePath ?? null
 })
 
-ipcMain.handle('window:openSettings', createSettingsWindow)
+ipcMain.handle('window:openSettings', () => createSettingsWindow())
 ipcMain.handle('window:quit', () => app.quit())
 ipcMain.handle('window:minimize', () => mainWindow?.minimize())
 
-// ---- chat streaming --------------------------------------------------------
-ipcMain.handle('chat:stream', async (_: any, opts: any) => {
-  const { providerId, model, messages, temperature = 0.7, maxTokens = 4096, signalId } = opts
-  const p = providerRegistry.get(providerId)
-  if (!p) throw new Error(`Provider ${providerId} not found`)
+// ---- IPC: chat streaming ---------------------------------------------------
+const MAX_MESSAGES = 500
+const ROLES = new Set(['system', 'user', 'assistant'])
 
-  const list = await readProviders()
-  const cfg = list.find((x: any) => x.id === providerId)
-  if (!cfg || !cfg.enabled) throw new Error(`Provider ${providerId} not enabled`)
+type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string }
+
+function parseChatRequest(raw: any): ChatRequest {
+  const providerId = str(raw?.providerId, 100)
+  const model = str(raw?.model, 200)
+  const signalId = str(raw?.signalId, 100)
+  if (!providerId || !model || !signalId) throw new Error('providerId, model and signalId are required')
+  if (!Array.isArray(raw.messages) || raw.messages.length === 0 || raw.messages.length > MAX_MESSAGES) {
+    throw new Error('messages must be a non-empty array')
+  }
+  const messages: Message[] = raw.messages
+    .filter((m: any) => m && ROLES.has(m.role) && typeof m.content === 'string' && m.content.trim() !== '')
+    .map((m: any) => ({ role: m.role, content: m.content }))
+  if (messages.length === 0) throw new Error('No non-empty messages to send')
+  return {
+    providerId, model, messages, signalId,
+    temperature: clamp(raw.temperature, 0, 2, 0.7),
+    maxTokens: Math.round(clamp(raw.maxTokens, 1, 131072, 4096)),
+  }
+}
+
+function localPrompt(messages: Message[]): string {
+  return messages.map((m) => `${m.role}: ${m.content}`).join('\n') + '\nassistant:'
+}
+
+ipcMain.handle('chat:stream', async (event, raw) => {
+  const req = parseChatRequest(raw)
+  if (activeStreams.has(req.signalId)) throw new Error('Stream id already in use')
+
+  const cfg = (await readProviders()).find((x) => x.id === req.providerId)
+  if (!cfg || cfg.enabled === false) throw new Error(`Provider ${req.providerId} is not configured or disabled`)
+  const provider = resolveProvider(cfg)
+  if (!provider) throw new Error(`Provider ${req.providerId} not found`)
 
   const controller = new AbortController()
-  activeStreams.set(signalId, controller)
-
-  const providerConfig: any = {
-    id: cfg.id, name: cfg.name, kind: cfg.kind, enabled: cfg.enabled,
-    apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel,
+  activeStreams.set(req.signalId, controller)
+  const sender = event.sender
+  const send = (chunk: ChatChunk) => {
+    if (!sender.isDestroyed()) sender.send('chat:chunk', { streamId: req.signalId, ...chunk })
   }
-  if (cfg.local) providerConfig.local = true
 
-  const streamed: string[] = []
   try {
-    for await (const chunk of p.chat({
-      model, messages: messages as any,
-      temperature, maxTokens: maxTokens as number,
-      signal: controller.signal,
-      config: providerConfig,
-    })) {
-      if (chunk.type === 'text' && chunk.content) {
-        streamed.push(chunk.content)
-        mainWindow?.webContents.send('chat:chunk', { streamId: signalId, type: 'text', content: chunk.content })
-      } else if (chunk.type === 'error') {
-        mainWindow?.webContents.send('chat:chunk', { streamId: signalId, type: 'error', error: chunk.error })
-      } else if (chunk.type === 'done') {
-        mainWindow?.webContents.send('chat:chunk', { streamId: signalId, type: 'done' })
-      }
+    const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
+      ? runLocalModel({
+          workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
+          prompt: localPrompt(req.messages), temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 1024),
+          signal: controller.signal,
+        })
+      : provider.chat({
+          model: req.model, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens,
+          signal: controller.signal,
+          config: { id: cfg.id, name: cfg.name, kind: cfg.kind, enabled: true, apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel },
+        })
+
+    for await (const chunk of stream) {
+      if (chunk.type === 'text' && chunk.content) send(chunk)
+      else if (chunk.type === 'error') { send(chunk); break }
     }
+  } catch (err) {
+    if (!controller.signal.aborted) send({ type: 'error', error: err instanceof Error ? err.message : String(err) })
   } finally {
-    activeStreams.delete(signalId)
+    activeStreams.delete(req.signalId)
+    send({ type: 'done' })
   }
-  return { streamId: signalId, text: streamed.join('') }
 })
 
-ipcMain.handle('chat:cancel', (_: any, signalId: string) => {
-  const ctrl = activeStreams.get(signalId)
-  if (ctrl) ctrl.abort()
-})
+ipcMain.handle('chat:cancel', (_e, signalId: string) => { activeStreams.get(signalId)?.abort() })
 
-// ---- local HF --------------------------------------------------------------
-const hfWorkers = new Map<string, Worker>()
-
+// ---- IPC: local Hugging Face models ----------------------------------------
 ipcMain.handle('hf:listLocal', async () => {
   try {
     if (!fs.existsSync(HF_CACHE)) return []
-    const entries = await fs.promises.readdir(HF_CACHE, { withFileTypes: true })
-    return entries.filter((e) => e.isDirectory()).map((e) => ({ id: e.name, name: e.name, downloaded: true }))
-  } catch { return [] }
-})
-
-ipcMain.handle('hf:download', async (_: any, modelId: string) => {
-  // Placeholder: real implementation spawns transformers.js download worker
-  fs.mkdirSync(HF_CACHE, { recursive: true })
-  await fs.promises.writeFile(path.join(HF_CACHE, modelId.replace(/\//g, '_'), '.placeholder'), '')
-  return { ok: true }
-})
-
-ipcMain.handle('hf:chatLocal', async (_: any, opts: any) => {
-  const { model, prompt, temperature = 0.7, maxTokens = 4096, signalId } = opts
-  const worker = new Worker(path.join(__dirname, 'hf-worker.js'), {
-    workerData: { model, prompt, temperature, maxTokens, streamId: signalId },
-  })
-  hfWorkers.set(signalId, worker)
-
-  return new Promise<void>((resolve, reject) => {
-    worker.on('message', (msg: any) => {
-      if (msg.type === 'text' || msg.type === 'error' || msg.type === 'done') {
-        mainWindow?.webContents.send('hf:chunk', { streamId: signalId, ...msg })
+    const found: { id: string; name: string; downloaded: boolean }[] = []
+    for (const org of await fs.promises.readdir(HF_CACHE, { withFileTypes: true })) {
+      if (!org.isDirectory()) continue
+      for (const model of await fs.promises.readdir(path.join(HF_CACHE, org.name), { withFileTypes: true })) {
+        if (model.isDirectory()) found.push({ id: `${org.name}/${model.name}`, name: `${org.name}/${model.name}`, downloaded: true })
       }
-      if (msg.type === 'done') {
-        hfWorkers.delete(signalId)
-        resolve()
-      }
-    })
-    worker.on('error', (err: Error) => {
-      mainWindow?.webContents.send('hf:chunk', { streamId: signalId, type: 'error', error: err.message })
-      hfWorkers.delete(signalId)
-      reject(err)
-    })
-  })
+    }
+    return found
+  } catch (err) {
+    console.error('hf:listLocal failed:', err)
+    return []
+  }
 })
 
-ipcMain.handle('hf:stopLocal', (_: any, signalId: string) => {
-  const w = hfWorkers.get(signalId)
-  if (w) {
-    w.terminate()
-    hfWorkers.delete(signalId)
+ipcMain.handle('hf:download', async (_e, modelId: string) => {
+  if (!isValidModelId(modelId)) throw new Error('Invalid model id')
+  await fs.promises.mkdir(HF_CACHE, { recursive: true })
+  for await (const chunk of runLocalModel({ workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: modelId, mode: 'download' })) {
+    if (chunk.type === 'error') throw new Error(chunk.error ?? 'Download failed')
   }
 })
 
 // ---- auto-updater ----------------------------------------------------------
+type Updater = typeof import('electron-updater').autoUpdater
+let updater: Updater | null = null
+
 function setupUpdater() {
   if (IS_DEV) return
-  const { autoUpdater } = require('electron-updater')
-  autoUpdater.checkForUpdatesAndNotify()
-  autoUpdater.on('update-available', () => mainWindow?.webContents.send('update:available'))
-  autoUpdater.on('update-downloaded', () => mainWindow?.webContents.send('update:downloaded'))
+  try {
+    updater = require('electron-updater').autoUpdater as Updater
+    updater.on('update-available', () => mainWindow?.webContents.send('update:available'))
+    updater.on('update-downloaded', () => mainWindow?.webContents.send('update:downloaded'))
+    updater.on('error', (err) => console.error('Auto-update error:', err))
+    updater.checkForUpdatesAndNotify().catch((err) => console.error('Update check failed:', err))
+  } catch (err) {
+    console.error('Auto-updater unavailable:', err)
+  }
 }
 
-// ---- lifecycle -------------------------------------------------------------
-app.whenReady().then(() => {
-  createMenu()
-  createWindow()
-  createTray()
-  setupUpdater()
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
-})
+ipcMain.handle('update:install', () => { isQuitting = true; updater?.quitAndInstall() })
 
+// ---- lifecycle -------------------------------------------------------------
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err))
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err))
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  app.on('second-instance', showMainWindow)
+
+  app.whenReady().then(() => {
+    createMenu()
+    createWindow()
+    createTray()
+    setupUpdater()
+    app.on('activate', showMainWindow)
+  }).catch((err) => {
+    console.error('Startup failed:', err)
+    dialog.showErrorBox('DeepSeek Harness', `Не удалось запустить приложение: ${err instanceof Error ? err.message : String(err)}`)
+    app.exit(1)
+  })
+}
+
+app.on('before-quit', () => {
+  isQuitting = true
+  activeStreams.forEach((c) => c.abort())
+  if (tray) { tray.destroy(); tray = null }
+})
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
-app.on('before-quit', () => { if (tray) { tray.destroy(); tray = null } })
 
 export { }

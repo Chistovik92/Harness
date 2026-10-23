@@ -3,33 +3,30 @@
  * Uses the standard /v1/chat/completions endpoint with SSE streaming.
  */
 
-import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { LLMProvider, type ProviderConfig, type ModelInfo, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
 
 export class OpenAICompatibleProvider extends LLMProvider {
   readonly id: ProviderId
   readonly name: string
   readonly kind: ProviderKind = 'openai-compatible'
+  private readonly defaultBaseUrl: string
+  private readonly defaultModel: string
 
   constructor(config: ProviderConfig) {
     super()
     this.id = config.id
     this.name = config.name
+    this.defaultBaseUrl = config.baseUrl ?? 'https://api.openai.com/v1'
+    this.defaultModel = config.defaultModel ?? 'gpt-4o-mini'
   }
 
   requiresKey() { return true }
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
   async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
-    // Return a hint model if we can't reach the endpoint; real models fetched lazily
-    return [
-      {
-        id: config.defaultModel || 'gpt-3.5-turbo',
-        name: config.defaultModel || 'gpt-3.5-turbo',
-        provider: this.id,
-        kind: this.kind,
-        contextWindow: 4096,
-      },
-    ]
+    const id = config.defaultModel || this.defaultModel
+    return [{ id, name: id, provider: this.id, kind: this.kind, contextWindow: 4096 }]
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {
@@ -39,10 +36,8 @@ export class OpenAICompatibleProvider extends LLMProvider {
       return
     }
 
-    const base = config.baseUrl?.replace(/\/$/, '') || 'https://api.openai.com/v1'
-    const url = `${base}/chat/completions`
-
-    const body: Record<string, unknown> = {
+    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/+$/, '')
+    const body = {
       model,
       messages: messages.map((m) => ({ role: m.role, content: m.content, ...(m.name ? { name: m.name } : {}) })),
       temperature,
@@ -50,55 +45,34 @@ export class OpenAICompatibleProvider extends LLMProvider {
       stream: true,
     }
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal,
-    })
-
-    if (!res.ok || !res.body) {
-      const text = await res.text().catch(() => '')
-      yield { type: 'error', error: `HTTP ${res.status}: ${text}` }
-      return
-    }
-
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-
     try {
-      while (true) {
-        if (signal?.aborted) {
-          reader.cancel()
-          yield { type: 'done' }
-          return
-        }
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith('data:')) continue
-          const payload = trimmed.slice(5).trim()
-          if (payload === '[DONE]') continue
-          try {
-            const data = JSON.parse(payload)
-            const delta = data.choices?.[0]?.delta?.content ?? ''
-            if (delta) yield { type: 'text', content: delta }
-          } catch {
-            // skip unparseable
-          }
+      const res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
+        body: JSON.stringify(body),
+        signal,
+      })
+      if (!res.ok || !res.body) {
+        yield await httpErrorChunk(res)
+        return
+      }
+
+      for await (const payload of readSSE(res, signal)) {
+        if (payload === '[DONE]') break
+        try {
+          const delta = JSON.parse(payload).choices?.[0]?.delta?.content ?? ''
+          if (delta) yield { type: 'text', content: delta }
+        } catch {
+          // keep-alive or partial frame
         }
       }
       yield { type: 'done' }
     } catch (err) {
-      yield { type: 'error', error: err instanceof Error ? err.message : String(err) }
+      if (signal?.aborted || isAbortError(err)) {
+        yield { type: 'done' }
+        return
+      }
+      yield { type: 'error', error: errorMessage(err) }
     }
   }
 }

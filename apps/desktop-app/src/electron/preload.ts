@@ -51,6 +51,14 @@ export type ChatChunk = {
   streamId?: string
 }
 
+export type StreamOptions = {
+  model: string
+  messages: { role: string; content: string }[]
+  temperature?: number
+  maxTokens?: number
+  signalId: string
+}
+
 type DshApi = {
   app: {
     getPath: (name: string) => Promise<string | null>
@@ -69,76 +77,59 @@ type DshApi = {
     listModels: (id: string) => Promise<ModelInfo[]>
   }
   chat: {
-    stream: (providerId: string, opts: {
-      model: string
-      messages: { role: string; content: string }[]
-      temperature?: number
-      maxTokens?: number
-      signalId: string
-    }) => Promise<{ cancel: () => void }>
+    /** Starts a stream; chunks arrive through onChunk. `done` rejects on validation errors. */
+    stream: (providerId: string, opts: StreamOptions) => { cancel: () => void; done: Promise<void> }
     onChunk: (cb: (chunk: ChatChunk & { streamId: string }) => void) => () => void
   }
   hf: {
     listLocal: () => Promise<{ id: string; name: string; downloaded: boolean }[]>
     download: (modelId: string) => Promise<void>
-    onChunk: (cb: (chunk: ChatChunk & { streamId: string }) => void) => () => void
-    startLocal: (opts: { model: string; prompt: string; temperature?: number; maxTokens?: number; signalId: string }) => Promise<void>
-    stopLocal: (signalId: string) => Promise<void>
   }
   window: {
     openSettings: () => Promise<void>
     quit: () => Promise<void>
-    minimize: () => void
+    minimize: () => Promise<void>
   }
   update: {
-    onAvailable: (cb: () => void) => void
-    onDownloaded: (cb: () => void) => void
+    onAvailable: (cb: () => void) => () => void
+    onDownloaded: (cb: () => void) => () => void
+    install: () => Promise<void>
   }
 }
 
-const activeStreams = new Map<string, () => void>()
+function subscribe<T extends unknown[]>(channel: string, cb: (...args: T) => void): () => void {
+  const handler = (_event: unknown, ...args: unknown[]) => cb(...(args as T))
+  ipcRenderer.on(channel, handler)
+  return () => { ipcRenderer.removeListener(channel, handler) }
+}
 
-contextBridge.exposeInMainWorld('__DSH__', {
+const api: DshApi = {
   app: {
-    getPath: (name: string) => ipcRenderer.invoke('app:getPath', name),
+    getPath: (name) => ipcRenderer.invoke('app:getPath', name),
     getVersion: () => ipcRenderer.invoke('app:getVersion'),
     isPackaged: () => ipcRenderer.invoke('app:isPackaged'),
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
-    set: (settings: Partial<Settings>) => ipcRenderer.invoke('settings:set', settings),
+    set: (settings) => ipcRenderer.invoke('settings:set', settings),
   },
   providers: {
     list: () => ipcRenderer.invoke('providers:list'),
-    get: (id: string) => ipcRenderer.invoke('providers:get', id),
-    set: (config: ProviderConfig) => ipcRenderer.invoke('providers:set', config),
-    remove: (id: string) => ipcRenderer.invoke('providers:remove', id),
-    listModels: (id: string) => ipcRenderer.invoke('providers:listModels', id),
+    get: (id) => ipcRenderer.invoke('providers:get', id),
+    set: (config) => ipcRenderer.invoke('providers:set', config),
+    remove: (id) => ipcRenderer.invoke('providers:remove', id),
+    listModels: (id) => ipcRenderer.invoke('providers:listModels', id),
   },
   chat: {
-    stream: async (providerId: string, opts: any) => {
-      const streamId = opts.signalId
-      const controller = new AbortController()
-      activeStreams.set(streamId, () => controller.abort())
-      const cancel = () => { activeStreams.delete(streamId); controller.abort() }
-      return { cancel }
-    },
-    onChunk: (cb: (chunk: ChatChunk & { streamId: string }) => void) => {
-      const handler = (_: any, chunk: ChatChunk & { streamId: string }) => cb(chunk)
-      ipcRenderer.on('chat:chunk', handler)
-      return () => ipcRenderer.removeListener('chat:chunk', handler)
-    },
+    stream: (providerId, opts) => ({
+      cancel: () => { void ipcRenderer.invoke('chat:cancel', opts.signalId) },
+      done: ipcRenderer.invoke('chat:stream', { providerId, ...opts }),
+    }),
+    onChunk: (cb) => subscribe('chat:chunk', cb),
   },
   hf: {
     listLocal: () => ipcRenderer.invoke('hf:listLocal'),
-    download: (modelId: string) => ipcRenderer.invoke('hf:download', modelId),
-    onChunk: (cb: (chunk: ChatChunk & { streamId: string }) => void) => {
-      const handler = (_: any, chunk: ChatChunk & { streamId: string }) => cb(chunk)
-      ipcRenderer.on('hf:chunk', handler)
-      return () => ipcRenderer.removeListener('hf:chunk', handler)
-    },
-    startLocal: (opts: any) => ipcRenderer.invoke('hf:chatLocal', opts),
-    stopLocal: (signalId: string) => ipcRenderer.invoke('hf:stopLocal', signalId),
+    download: (modelId) => ipcRenderer.invoke('hf:download', modelId),
   },
   window: {
     openSettings: () => ipcRenderer.invoke('window:openSettings'),
@@ -146,10 +137,13 @@ contextBridge.exposeInMainWorld('__DSH__', {
     minimize: () => ipcRenderer.invoke('window:minimize'),
   },
   update: {
-    onAvailable: (cb: () => void) => ipcRenderer.on('update:available', cb),
-    onDownloaded: (cb: () => void) => ipcRenderer.on('update:downloaded', cb),
+    onAvailable: (cb) => subscribe('update:available', cb),
+    onDownloaded: (cb) => subscribe('update:downloaded', cb),
+    install: () => ipcRenderer.invoke('update:install'),
   },
-})
+}
+
+contextBridge.exposeInMainWorld('__DSH__', api)
 
 declare global {
   interface Window {

@@ -1,9 +1,11 @@
 /**
  * Google (Gemini) provider.
- * Uses the generativeLanguage API with SSE.
+ * Uses :streamGenerateContent with alt=sse; the API key is sent in a header,
+ * never in the URL, so it cannot leak into logs or error messages.
  */
 
-import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { LLMProvider, type ProviderConfig, type ModelInfo, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
 
 export class GoogleProvider extends LLMProvider {
   readonly id: ProviderId
@@ -19,7 +21,7 @@ export class GoogleProvider extends LLMProvider {
   requiresKey() { return true }
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
-  async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
+  async listModels(_config: ProviderConfig): Promise<ModelInfo[]> {
     return [
       { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', provider: this.id, kind: this.kind, contextWindow: 2000000 },
       { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', provider: this.id, kind: this.kind, contextWindow: 1000000 },
@@ -33,57 +35,45 @@ export class GoogleProvider extends LLMProvider {
       return
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${config.apiKey}`
-
-    const body = {
-      contents: messages.map((m) => ({
-        role: m.role === 'system' ? 'user' : m.role,
-        parts: [{ text: m.content }],
-      })),
+    const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n')
+    const body: Record<string, unknown> = {
+      contents: messages
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
       generationConfig: { temperature, maxOutputTokens: maxTokens },
     }
+    if (system) body.systemInstruction = { parts: [{ text: system }] }
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    })
-
-    if (!res.ok || !res.body) {
-      const text = await res.text().catch(() => '')
-      yield { type: 'error', error: `HTTP ${res.status}: ${text}` }
-      return
-    }
-
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`
 
     try {
-      while (true) {
-        if (signal?.aborted) { reader.cancel(); yield { type: 'done' }; return }
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed.startsWith('data:')) continue
-          const payload = trimmed.slice(5).trim()
-          try {
-            const data = JSON.parse(payload)
-            const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
-            if (text) yield { type: 'text', content: text }
-          } catch {
-            // skip
-          }
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': config.apiKey },
+        body: JSON.stringify(body),
+        signal,
+      })
+      if (!res.ok || !res.body) {
+        yield await httpErrorChunk(res)
+        return
+      }
+
+      for await (const payload of readSSE(res, signal)) {
+        try {
+          const parts: { text?: string }[] = JSON.parse(payload).candidates?.[0]?.content?.parts ?? []
+          const text = parts.map((p) => p.text ?? '').join('')
+          if (text) yield { type: 'text', content: text }
+        } catch {
+          // partial frame
         }
       }
       yield { type: 'done' }
     } catch (err) {
-      yield { type: 'error', error: err instanceof Error ? err.message : String(err) }
+      if (signal?.aborted || isAbortError(err)) {
+        yield { type: 'done' }
+        return
+      }
+      yield { type: 'error', error: errorMessage(err) }
     }
   }
 }

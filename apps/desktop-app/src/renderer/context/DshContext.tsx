@@ -30,13 +30,12 @@ export function DshProvider({ children }: { children: React.ReactNode }) {
   const [isConnected, setIsConnected] = useState(false)
 
   useEffect(() => {
-    ;(async () => {
-      const s = await window.__DSH__.settings.get()
+    window.__DSH__.settings.get().then((s) => {
       setSettingsState(s)
       setApiKeyState(s.apiKey ?? '')
       setBaseUrlState(s.baseUrl ?? 'https://api.deepseek.com')
       setModelState(s.model ?? 'deepseek-chat')
-    })()
+    }).catch((err) => console.error('Failed to load settings:', err))
   }, [])
 
   const saveSettings = useCallback(async (s: Partial<Settings>) => {

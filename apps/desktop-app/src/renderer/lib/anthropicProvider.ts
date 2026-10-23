@@ -3,7 +3,8 @@
  * Uses /v1/messages with SSE streaming.
  */
 
-import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { LLMProvider, type ProviderConfig, type ModelInfo, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
 
 export class AnthropicProvider extends LLMProvider {
   readonly id: ProviderId
@@ -19,7 +20,7 @@ export class AnthropicProvider extends LLMProvider {
   requiresKey() { return true }
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
-  async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
+  async listModels(_config: ProviderConfig): Promise<ModelInfo[]> {
     return [
       { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: this.id, kind: this.kind, contextWindow: 200000 },
       { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku', provider: this.id, kind: this.kind, contextWindow: 200000 },
@@ -34,63 +35,58 @@ export class AnthropicProvider extends LLMProvider {
     }
 
     const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n')
-    const chatMessages = messages.filter((m) => m.role !== 'system')
+    const chatMessages = messages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .map((m) => ({ role: m.role, content: m.content }))
 
-    const body = {
+    const body: Record<string, unknown> = {
       model,
       max_tokens: maxTokens,
-      temperature,
-      system,
-      messages: chatMessages.map((m) => ({ role: m.role, content: m.content })),
+      // Anthropic accepts temperature in [0, 1] only.
+      temperature: Math.min(1, Math.max(0, temperature)),
+      messages: chatMessages,
       stream: true,
     }
-
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': config.apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
-      signal,
-    })
-
-    if (!res.ok || !res.body) {
-      const text = await res.text().catch(() => '')
-      yield { type: 'error', error: `HTTP ${res.status}: ${text}` }
-      return
-    }
-
-    const reader = res.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
+    if (system) body.system = system
 
     try {
-      while (true) {
-        if (signal?.aborted) { reader.cancel(); yield { type: 'done' }; return }
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.startsWith('data:')) continue
-          const payload = line.slice(5).trim()
-          try {
-            const data = JSON.parse(payload)
-            if (data.type === 'content_block_delta' && data.delta?.text) {
-              yield { type: 'text', content: data.delta.text }
-            }
-            if (data.type === 'message_stop') yield { type: 'done' }
-          } catch {
-            // skip
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': config.apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify(body),
+        signal,
+      })
+      if (!res.ok || !res.body) {
+        yield await httpErrorChunk(res)
+        return
+      }
+
+      for await (const payload of readSSE(res, signal)) {
+        try {
+          const data = JSON.parse(payload)
+          if (data.type === 'content_block_delta' && data.delta?.text) {
+            yield { type: 'text', content: data.delta.text }
+          } else if (data.type === 'error') {
+            yield { type: 'error', error: data.error?.message ?? 'Anthropic stream error' }
+            return
+          } else if (data.type === 'message_stop') {
+            break
           }
+        } catch {
+          // partial frame
         }
       }
       yield { type: 'done' }
     } catch (err) {
-      yield { type: 'error', error: err instanceof Error ? err.message : String(err) }
+      if (signal?.aborted || isAbortError(err)) {
+        yield { type: 'done' }
+        return
+      }
+      yield { type: 'error', error: errorMessage(err) }
     }
   }
 }

@@ -9,6 +9,7 @@
   },
   "files": [
     "dist/**/*",
+    "resources/icon.png",
     "node_modules/**/*",
     "!**/*.md",
     "!**/test/**"
@@ -91,5 +92,6 @@
       "private": false,
       "releaseType": "release"
     }
-  ]
+  ],
+  "asar": false
 }

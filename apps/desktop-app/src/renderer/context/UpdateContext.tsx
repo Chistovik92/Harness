@@ -1,9 +1,8 @@
-import { createContext, useContext } from 'react'
+import { createContext, useContext, useEffect, useState } from 'react'
 
 type UpdateContext = {
   available: boolean
   downloaded: boolean
-  check: () => void
   install: () => void
 }
 
@@ -19,18 +18,17 @@ export function UpdateProvider({ children }: { children: React.ReactNode }) {
   const [available, setAvailable] = useState(false)
   const [downloaded, setDownloaded] = useState(false)
 
-  const check = () => {
-    // electron-updater runs in main; renderer receives events via IPC
-  }
-  const install = () => {
-    // handled by main on 'update:downloaded'
-  }
+  useEffect(() => {
+    const offAvailable = window.__DSH__.update.onAvailable(() => setAvailable(true))
+    const offDownloaded = window.__DSH__.update.onDownloaded(() => setDownloaded(true))
+    return () => { offAvailable(); offDownloaded() }
+  }, [])
+
+  const install = () => { void window.__DSH__.update.install() }
 
   return (
-    <UpdateContext.Provider value={{ available, downloaded, check, install }}>
+    <UpdateContext.Provider value={{ available, downloaded, install }}>
       {children}
     </UpdateContext.Provider>
   )
 }
-
-import { useState } from 'react'

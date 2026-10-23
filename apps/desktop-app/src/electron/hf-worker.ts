@@ -1,53 +1,50 @@
 /**
  * DeepSeek Harness Desktop — Hugging Face local inference Worker.
  *
- * Runs @xenova/transformers in a separate Node worker thread so the UI
- * never blocks while a local model generates text. Results are streamed
- * back to the renderer via parentPort + IPC in the main process.
+ * Runs @xenova/transformers in a separate worker thread so the UI never
+ * blocks while a local model downloads or generates. Results are posted
+ * back to the main process through parentPort.
  */
 
-import { parentPort, workerData } from 'node:worker_threads';
+import { parentPort, workerData } from 'node:worker_threads'
 
 interface HFWorkerData {
-  model: string;
-  prompt: string;
-  temperature: number;
-  maxTokens: number;
-  streamId: string;
+  mode: 'generate' | 'download'
+  model: string
+  prompt: string
+  temperature: number
+  maxTokens: number
+  cacheDir: string
 }
 
-let aborted = false;
+// transformers.js is ESM-only; keep a real dynamic import() under CommonJS output.
+const importEsm = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>
 
-async function run() {
-  const { model, prompt, temperature, maxTokens, streamId } = workerData as HFWorkerData;
+async function run(): Promise<void> {
+  const { mode, model, prompt, temperature, maxTokens, cacheDir } = workerData as HFWorkerData
 
-  const { pipeline } = await import('@xenova/transformers');
+  const transformers = await importEsm('@xenova/transformers')
+  transformers.env.cacheDir = cacheDir
+  transformers.env.allowLocalModels = false
 
-  const generator = await pipeline('text-generation', model);
-
-  // transformers.js v2 types do not expose the streaming AsyncGenerator,
-  // so we cast through any to use the runtime stream: true API.
-  const stream = (await (generator as any)(prompt, {
-    stream: true,
-    max_new_tokens: maxTokens,
-    temperature,
-  })) as AsyncGenerator<any>;
-
-  for await (const chunk of stream) {
-    if (aborted) break;
-    const text = chunk?.token?.text ?? chunk?.generated_text ?? '';
-    if (text) {
-      parentPort?.postMessage({ type: 'text', content: text, streamId });
-    }
+  const generator = await transformers.pipeline('text-generation', model)
+  if (mode === 'download') {
+    parentPort?.postMessage({ type: 'done' })
+    return
   }
 
-  parentPort?.postMessage({ type: 'done', streamId });
+  const output = await generator(prompt, {
+    max_new_tokens: maxTokens,
+    temperature: Math.max(temperature, 0.01),
+    do_sample: temperature > 0,
+  })
+
+  const full: string = Array.isArray(output) ? (output[0]?.generated_text ?? '') : (output?.generated_text ?? '')
+  const text = full.startsWith(prompt) ? full.slice(prompt.length) : full
+  if (text) parentPort?.postMessage({ type: 'text', content: text })
+  parentPort?.postMessage({ type: 'done' })
 }
 
-run().catch((err: Error) => {
-  parentPort?.postMessage({ type: 'error', error: err.message, streamId: (workerData as HFWorkerData).streamId });
-});
-
-export function abort() {
-  aborted = true;
-}
+run().catch((err: unknown) => {
+  parentPort?.postMessage({ type: 'error', error: err instanceof Error ? err.message : String(err) })
+})

@@ -27,19 +27,27 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
     const list = await window.__DSH__.providers.list()
     // merge with defaults so all known providers appear
     const byId = new Map(list.map((p: any) => [p.id, p]))
-    const merged = DEFAULT_PROVIDERS.map((d) => ({ ...d, ...byId.get(d.id) }))
-    setProviders(merged)
+    const defaults = DEFAULT_PROVIDERS.map((d) => ({ enabled: true, ...d, ...byId.get(d.id) }))
+    const custom = list.filter((p: any) => !DEFAULT_PROVIDERS.some((d) => d.id === p.id))
+    setProviders([...defaults, ...custom] as ProviderConfig[])
   }
 
+  const [error, setError] = useState<string | null>(null)
+
   async function saveProvider(p: ProviderConfig) {
-    await window.__DSH__.providers.set(p)
-    await load()
-    setEditing(null)
+    try {
+      await window.__DSH__.providers.set(p)
+      setError(null)
+      await load()
+      setEditing(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err))
+    }
   }
 
   async function removeProvider(id: string) {
     if (!confirm('Удалить провайдера?')) return
-    await window.__DSH__.providers.remove(id)
+    await window.__DSH__.providers.remove(id).catch((err) => setError(String(err)))
     await load()
   }
 
@@ -49,7 +57,7 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
   }
 
   function startEdit(p: ProviderConfig) {
-    setForm({ ...p })
+    setForm({ ...p, enabled: p.enabled !== false })
     setEditing(p.id)
   }
 
@@ -98,6 +106,8 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
           </div>
         ))}
       </div>
+
+      {error && <div className="p-3 rounded border border-red-700/50 bg-red-900/20 text-red-200 text-sm">{error}</div>}
 
       {editing && (
         <div className="border border-slate-800 rounded-lg p-6 bg-slate-900">
