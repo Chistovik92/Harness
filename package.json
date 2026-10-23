@@ -1,9 +1,9 @@
 {
   "name": "dsh-harness-local",
   "private": true,
-  "description": "Local packaging of DeepSeek Harness Desktop installer (Windows / Linux / macOS)",
-  "version": "0.2.1-rc.3",
-
+  "description": "DeepSeek Harness Desktop — AI assistant desktop app (Windows / Linux / macOS)",
+  "version": "1.0.0",
+  "workspaces": ["apps/desktop-app"],
   "scripts": {
     "build:desktop-app": "pnpm --dir apps/desktop-app run build",
     "dev:desktop-app": "pnpm --dir apps/desktop-app run dev",
@@ -11,6 +11,16 @@
     "package:mac": "pnpm --dir apps/desktop-app run package:mac",
     "package:linux": "pnpm --dir apps/desktop-app run package:linux",
     "package:all": "pnpm --dir apps/desktop-app run package:all",
-    "check:package": "pnpm --dir apps/desktop run check:package"
-  }
+    "release:patch": "standard-version --release-as patch",
+    "release:minor": "standard-version --release-as minor",
+    "release:major": "standard-version --release-as major"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Chistovik92/Harness.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Chistovik92/Harness/issues"
+  },
+  "homepage": "https://github.com/Chistovik92/Harness#readme"
 }

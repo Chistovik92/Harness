@@ -14,7 +14,8 @@
     "!**/test/**"
   ],
   "extraMetadata": {
-    "main": "dist/electron/main.js"
+    "main": "dist/electron/main.js",
+    "description": "DeepSeek Harness Desktop — AI assistant for DeepSeek, OpenAI, Anthropic, Google, Hugging Face and local models"
   },
   "mac": {
     "target": ["dmg", "zip"],
@@ -67,7 +68,8 @@
       "provider": "github",
       "owner": "Chistovik92",
       "repo": "Harness",
-      "vPrefixedTagName": true
+      "vPrefixedTagName": true,
+      "private": false
     }
   ]
 }
