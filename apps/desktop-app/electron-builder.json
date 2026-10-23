@@ -15,7 +15,12 @@
   ],
   "extraMetadata": {
     "main": "dist/electron/electron/main.js",
-    "description": "DeepSeek Harness Desktop — AI assistant for DeepSeek, OpenAI, Anthropic, Google, Hugging Face and local models"
+    "description": "DeepSeek Harness Desktop — AI assistant for DeepSeek, OpenAI, Anthropic, Google, Hugging Face and local models",
+    "homepage": "https://github.com/Chistovik92/Harness#readme",
+    "author": {
+      "name": "DeepSeek AI",
+      "email": "Chistovik92@users.noreply.github.com"
+    }
   },
   "mac": {
     "target": [
@@ -25,11 +30,11 @@
     "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
     "entitlements": "resources/entitlements.mac.plist",
     "gatekeeperAssess": false,
-    "hardenedRuntime": true
+    "hardenedRuntime": true,
+    "icon": "resources/icon.png"
   },
   "dmg": {
     "format": "ULFO",
-    "icon": "resources/icon.icns",
     "contents": [
       {
         "x": 130,
@@ -48,8 +53,8 @@
     "target": [
       "nsis"
     ],
-    "artifactName": "${productName}-${version}-win-${arch}-${isUnsigned ? 'unsigned' : 'signed'}.${ext}",
-    "icon": "resources/icon.ico",
+    "artifactName": "${productName}-${version}-win-${arch}.${ext}",
+    "icon": "resources/icon.png",
     "publisherName": "DeepSeek AI"
   },
   "nsis": {
