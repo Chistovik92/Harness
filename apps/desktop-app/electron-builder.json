@@ -18,25 +18,36 @@
     "description": "DeepSeek Harness Desktop — AI assistant for DeepSeek, OpenAI, Anthropic, Google, Hugging Face and local models"
   },
   "mac": {
-    "target": ["dmg", "zip"],
+    "target": [
+      "dmg",
+      "zip"
+    ],
     "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
     "entitlements": "resources/entitlements.mac.plist",
     "gatekeeperAssess": false,
-    "hardening": {
-      "entitlements": "resources/entitlements.mac.plist",
-      "entitlementsInherit": "resources/entitlements.mac.plist"
-    }
+    "hardenedRuntime": true
   },
   "dmg": {
-    "format": "ULMO",
+    "format": "ULFO",
     "icon": "resources/icon.icns",
     "contents": [
-      { "x": 130, "y": 220, "type": "link", "path": "/Applications" },
-      { "x": 410, "y": 220, "type": "file" }
+      {
+        "x": 130,
+        "y": 220,
+        "type": "link",
+        "path": "/Applications"
+      },
+      {
+        "x": 410,
+        "y": 220,
+        "type": "file"
+      }
     ]
   },
   "win": {
-    "target": ["nsis"],
+    "target": [
+      "nsis"
+    ],
     "artifactName": "${productName}-${version}-win-${arch}-${isUnsigned ? 'unsigned' : 'signed'}.${ext}",
     "icon": "resources/icon.ico",
     "publisherName": "DeepSeek AI"
@@ -52,7 +63,11 @@
     "uninstallDisplayName": "DeepSeek Harness"
   },
   "linux": {
-    "target": ["AppImage", "deb", "rpm"],
+    "target": [
+      "AppImage",
+      "deb",
+      "rpm"
+    ],
     "artifactName": "${productName}-${version}-linux-${arch}.${ext}",
     "category": "Development",
     "icon": "resources/icon.png",
