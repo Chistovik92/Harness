@@ -6,132 +6,64 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Release version (e.g. 1.0.0)'
+      tag:
+        description: 'Existing tag to build and release (e.g. v1.0.0)'
         required: true
-        default: '1.0.0'
 
 env:
-  APP_NAME: DeepSeek Harness
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    if: github.event_name == 'push' || github.event.inputs.version != ''
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            flags: --win --x64
+          - os: macos-latest
+            flags: --mac --arm64 --x64
+          - os: ubuntu-latest
+            flags: --linux --x64 --arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          cache: 'npm'
+          node-version: '22'
 
-      - name: Install dependencies
-        working-directory: apps/desktop-app
-        run: npm ci
+      - name: Install rpm tooling
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
 
-      - name: Build app
-        working-directory: apps/desktop-app
-        run: npm run build
-
-      - name: Package Windows (NSIS)
-        id: package-windows
-        working-directory: apps/desktop-app
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Older tags declare apps/desktop-app as a root workspace whose lockfile
+      # is not committed, and carry a stale package version. Normalise both so
+      # every tag builds the same way and publishes to its own release.
+      - name: Prepare package metadata
+        shell: bash
         run: |
-          npx electron-builder --win --x64 --publish always
-
-  build-macos:
-    runs-on: macos-latest
-    if: github.event_name == 'push' || github.event.inputs.version != ''
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: 'npm'
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.workspaces;fs.writeFileSync('package.json',JSON.stringify(p,null,2))"
+          cd apps/desktop-app
+          npm pkg set version="${RELEASE_TAG#v}"
 
       - name: Install dependencies
         working-directory: apps/desktop-app
-        run: npm ci
+        shell: bash
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
       - name: Build app
         working-directory: apps/desktop-app
         run: npm run build
 
-      - name: Package macOS (DMG + ZIP)
-        id: package-macos
+      - name: Package and publish
         working-directory: apps/desktop-app
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-        run: |
-          npx electron-builder --mac --arm64 --x64 --publish always
-
-  build-linux:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.inputs.version != ''
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: 'npm'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fuse libfuse2
-
-      - name: Install dependencies
-        working-directory: apps/desktop-app
-        run: npm ci
-
-      - name: Build app
-        working-directory: apps/desktop-app
-        run: npm run build
-
-      - name: Package Linux (AppImage + deb + rpm)
-        id: package-linux
-        working-directory: apps/desktop-app
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          npx electron-builder --linux --x64 --arm64 --publish always
-
-  release:
-    needs: [build-windows, build-macos, build-linux]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: DeepSeek Harness ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
+        run: npx electron-builder ${{ matrix.flags }} --publish always

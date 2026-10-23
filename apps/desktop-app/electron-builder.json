@@ -69,7 +69,8 @@
       "owner": "Chistovik92",
       "repo": "Harness",
       "vPrefixedTagName": true,
-      "private": false
+      "private": false,
+      "releaseType": "release"
     }
   ]
 }

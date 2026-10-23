@@ -3,7 +3,6 @@
   "private": true,
   "description": "DeepSeek Harness Desktop — AI assistant desktop app (Windows / Linux / macOS)",
   "version": "1.0.0",
-  "workspaces": ["apps/desktop-app"],
   "scripts": {
     "build:desktop-app": "pnpm --dir apps/desktop-app run build",
     "dev:desktop-app": "pnpm --dir apps/desktop-app run dev",
