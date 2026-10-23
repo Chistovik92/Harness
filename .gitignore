@@ -1,0 +1,37 @@
+# DeepSeek Harness Desktop - local build outputs
+.desktop-build/
+release/
+*.exe
+*.dmg
+*.zip
+*.AppImage
+*.deb
+*.rpm
+
+# Environment (secrets) - do not commit
+apps/desktop/.env.windows
+apps/desktop/.env.macos
+
+# Node
+node_modules/
+.pnpm-store/
+*.log
+npm-debug.log*
+
+# TypeScript / tsdown
+lib/
+dist/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
