@@ -1,0 +1,114 @@
+import { createContext, useContext, useState, useCallback, useEffect } from 'react'
+import type { ChatMessage } from '../../electron/preload'
+export type { ChatMessage }
+import {
+  getSessions,
+  saveSession,
+  deleteSession as dbDeleteSession,
+  getMessages,
+  saveMessage as dbSaveMessage,
+  deleteMessagesForSession,
+  type StoredSession,
+  type StoredMessage,
+} from '@/lib/storage'
+
+type ChatContext = {
+  messages: ChatMessage[]
+  currentSessionId: string | null
+  sessions: StoredSession[]
+  addMessage: (msg: ChatMessage) => void
+  setMessages: (msgs: ChatMessage[]) => void
+  appendStream: (id: string, chunk: string) => void
+  createSession: () => Promise<string>
+  switchSession: (id: string) => void
+  deleteSession: (id: string) => void
+  isLoading: boolean
+  setIsLoading: (v: boolean) => void
+}
+
+const ChatContext = createContext<ChatContext | null>(null)
+
+export function useChat() {
+  const ctx = useContext(ChatContext)
+  if (!ctx) throw new Error('useChat must be used within ChatProvider')
+  return ctx
+}
+
+function toStored(m: ChatMessage, sessionId: string): StoredMessage {
+  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt }
+}
+
+function toChat(m: StoredMessage): ChatMessage {
+  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt }
+}
+
+export function ChatProvider({ children }: { children: React.ReactNode }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
+  const [sessions, setSessions] = useState<StoredSession[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+
+  useEffect(() => {
+    ;(async () => {
+      const ss = await getSessions()
+      setSessions(ss)
+      if (ss.length > 0) {
+        const first = ss[0]
+        setCurrentSessionId(first.id)
+        const msgs = await getMessages(first.id)
+        setMessages(msgs.map(toChat))
+      }
+    })()
+  }, [])
+
+  const addMessage = useCallback((msg: ChatMessage) => {
+    setMessages((prev) => [...prev, msg])
+    if (currentSessionId) {
+      dbSaveMessage(toStored(msg, currentSessionId)).catch(console.error)
+    }
+  }, [currentSessionId])
+
+  const appendStream = useCallback((id: string, chunk: string) => {
+    setMessages((prev) =>
+      prev.map((m: ChatMessage) => (m.id === id ? { ...m, content: m.content + chunk } : m))
+    )
+  }, [])
+
+  const createSession = useCallback(async () => {
+    const id = crypto.randomUUID()
+    const session: StoredSession = { id, title: 'Новый чат', updatedAt: Date.now() }
+    await saveSession(session)
+    setSessions((prev) => [session, ...prev])
+    setCurrentSessionId(id)
+    setMessages([])
+    return id
+  }, [])
+
+  const switchSession = useCallback(async (id: string) => {
+    setCurrentSessionId(id)
+    const msgs = await getMessages(id)
+    setMessages(msgs.map(toChat))
+  }, [])
+
+  const deleteSession = useCallback(async (id: string) => {
+    await dbDeleteSession(id)
+    await deleteMessagesForSession(id)
+    setSessions((prev) => prev.filter((x) => x.id !== id))
+    if (currentSessionId === id) {
+      const remaining = sessions.filter((x) => x.id !== id)
+      setCurrentSessionId(remaining.length > 0 ? remaining[0].id : null)
+      if (remaining.length > 0) {
+        const msgs = await getMessages(remaining[0].id)
+        setMessages(msgs.map(toChat))
+      } else {
+        setMessages([])
+      }
+    }
+  }, [currentSessionId, sessions])
+
+  return (
+    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
+      {children}
+    </ChatContext.Provider>
+  )
+}

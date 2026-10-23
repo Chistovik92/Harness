@@ -11,6 +11,7 @@ release/
 # Environment (secrets) - do not commit
 apps/desktop/.env.windows
 apps/desktop/.env.macos
+apps/desktop-app/.env
 
 # Node
 node_modules/
@@ -18,7 +19,7 @@ node_modules/
 *.log
 npm-debug.log*
 
-# TypeScript / tsdown
+# TypeScript / tsdown / vite
 lib/
 dist/
 *.tsbuildinfo

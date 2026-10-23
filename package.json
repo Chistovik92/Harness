@@ -3,13 +3,14 @@
   "private": true,
   "description": "Local packaging of DeepSeek Harness Desktop installer (Windows / Linux / macOS)",
   "version": "0.2.1-rc.3",
+
   "scripts": {
-    "build:desktop": "pnpm --dir apps/desktop run build",
-    "package:win:x64": "pnpm --dir apps/desktop run package:win:x64",
-    "package:win:x64:unsigned": "pnpm --dir apps/desktop run package:win:x64:unsigned",
-    "package:mac:arm64": "pnpm --dir apps/desktop run package:mac:arm64",
-    "package:mac:x64": "pnpm --dir apps/desktop run package:mac:x64",
-    "package:linux:x64": "pnpm --dir apps/desktop run package:linux:x64",
+    "build:desktop-app": "pnpm --dir apps/desktop-app run build",
+    "dev:desktop-app": "pnpm --dir apps/desktop-app run dev",
+    "package:win:x64": "pnpm --dir apps/desktop-app run package:win",
+    "package:mac": "pnpm --dir apps/desktop-app run package:mac",
+    "package:linux": "pnpm --dir apps/desktop-app run package:linux",
+    "package:all": "pnpm --dir apps/desktop-app run package:all",
     "check:package": "pnpm --dir apps/desktop run check:package"
   }
 }
