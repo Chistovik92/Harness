@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback, useEffect } from 'react'
-import type { Settings, ChatMessage } from '../../electron/preload'
+import type { Settings } from '../../electron/preload'
 
 type DshContext = {
   settings: Settings
@@ -42,9 +42,9 @@ export function DshProvider({ children }: { children: React.ReactNode }) {
   const saveSettings = useCallback(async (s: Partial<Settings>) => {
     const next = await window.__DSH__.settings.set(s)
     setSettingsState(next)
-    if (s.apiKey !== undefined) setApiKeyState(s.apiKey)
-    if (s.baseUrl !== undefined) setBaseUrlState(s.baseUrl)
-    if (s.model !== undefined) setModelState(s.model)
+    if (s.apiKey !== undefined) setApiKeyState(String(s.apiKey))
+    if (s.baseUrl !== undefined) setBaseUrlState(String(s.baseUrl))
+    if (s.model !== undefined) setModelState(String(s.model))
   }, [])
 
   return (

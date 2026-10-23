@@ -21,6 +21,7 @@ npm-debug.log*
 
 # TypeScript / tsdown / vite
 lib/
+!apps/desktop-app/src/renderer/lib/
 dist/
 *.tsbuildinfo
 
