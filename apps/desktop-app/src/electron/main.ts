@@ -19,7 +19,7 @@ import { HuggingFaceProvider } from '../renderer/lib/huggingfaceProvider'
 import { providerRegistry } from '../renderer/lib/registry'
 import type { LLMProvider, ProviderKind, Message, ChatChunk } from '../renderer/lib/providers'
 import { encrypt, decrypt, generateKey, isValidKey } from './secureStore'
-import { runLocalModel, isValidModelId } from './localHf'
+import { runLocalModel, isValidModelId, type DownloadProgress } from './localHf'
 
 // ---- providers -------------------------------------------------------------
 type StoredProvider = {
@@ -58,6 +58,13 @@ function resolveProvider(cfg: StoredProvider): LLMProvider | undefined {
 }
 
 const isLocalHf = (cfg: StoredProvider) => cfg.kind === 'huggingface-local' || cfg.local === true
+
+/** Built-in providers that work without any saved configuration (local models need no key). */
+function builtinConfig(id: string): StoredProvider | undefined {
+  const p = providerRegistry.get(id)
+  if (!p || p.requiresKey()) return undefined
+  return { id: p.id, name: p.name, kind: p.kind, enabled: true, ...(p.kind === 'huggingface-local' ? { local: true } : {}) }
+}
 
 // ---- paths -----------------------------------------------------------------
 const IS_DEV = !app.isPackaged
@@ -380,10 +387,15 @@ ipcMain.handle('providers:listModels', async (_e, providerId: string) => {
   const cfg = (await readProviders()).find((x) => x.id === providerId)
   const provider = cfg ? resolveProvider(cfg) : providerRegistry.get(providerId)
   if (!provider) return []
-  return provider.listModels({
+  const models = await provider.listModels({
     id: provider.id, name: provider.name, kind: provider.kind,
     apiKey: cfg?.apiKey, baseUrl: cfg?.baseUrl, defaultModel: cfg?.defaultModel, enabled: cfg?.enabled !== false,
   })
+  if (provider.kind !== 'huggingface-local') return models
+  // Downloaded models first, then the built-in suggestions that are not on disk yet.
+  const downloaded = (await listDownloadedModels().catch(() => [])).map((m) => ({ id: m.id, name: m.id, provider: provider.id, kind: provider.kind, local: true, downloaded: true }))
+  const have = new Set(downloaded.map((m) => m.id))
+  return [...downloaded, ...models.filter((m) => !have.has(m.id))]
 })
 
 ipcMain.handle('dialog:openFile', async () => {
@@ -426,15 +438,12 @@ function parseChatRequest(raw: any): ChatRequest {
   }
 }
 
-function localPrompt(messages: Message[]): string {
-  return messages.map((m) => `${m.role}: ${m.content}`).join('\n') + '\nassistant:'
-}
-
 ipcMain.handle('chat:stream', async (event, raw) => {
   const req = parseChatRequest(raw)
   if (activeStreams.has(req.signalId)) throw new Error('Stream id already in use')
 
-  const cfg = (await readProviders()).find((x) => x.id === req.providerId)
+  const saved = (await readProviders()).find((x) => x.id === req.providerId)
+  const cfg = saved ?? builtinConfig(req.providerId)
   if (!cfg || cfg.enabled === false) throw new Error(`Provider ${req.providerId} is not configured or disabled`)
   const provider = resolveProvider(cfg)
   if (!provider) throw new Error(`Provider ${req.providerId} not found`)
@@ -450,7 +459,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
     const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
       ? runLocalModel({
           workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
-          prompt: localPrompt(req.messages), temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 1024),
+          messages: req.messages, temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
           signal: controller.signal,
         })
       : provider.chat({
@@ -474,29 +483,82 @@ ipcMain.handle('chat:stream', async (event, raw) => {
 ipcMain.handle('chat:cancel', (_e, signalId: string) => { activeStreams.get(signalId)?.abort() })
 
 // ---- IPC: local Hugging Face models ----------------------------------------
-ipcMain.handle('hf:listLocal', async () => {
-  try {
-    if (!fs.existsSync(HF_CACHE)) return []
-    const found: { id: string; name: string; downloaded: boolean }[] = []
-    for (const org of await fs.promises.readdir(HF_CACHE, { withFileTypes: true })) {
-      if (!org.isDirectory()) continue
-      for (const model of await fs.promises.readdir(path.join(HF_CACHE, org.name), { withFileTypes: true })) {
-        if (model.isDirectory()) found.push({ id: `${org.name}/${model.name}`, name: `${org.name}/${model.name}`, downloaded: true })
-      }
+type LocalModel = { id: string; name: string; downloaded: boolean; sizeBytes: number }
+
+async function dirSize(dir: string): Promise<number> {
+  let total = 0
+  for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    total += entry.isDirectory() ? await dirSize(full) : (await fs.promises.stat(full)).size
+  }
+  return total
+}
+
+/** Models already in the cache, laid out as <cache>/<org>/<name>. */
+async function listDownloadedModels(): Promise<LocalModel[]> {
+  if (!fs.existsSync(HF_CACHE)) return []
+  const found: LocalModel[] = []
+  for (const org of await fs.promises.readdir(HF_CACHE, { withFileTypes: true })) {
+    if (!org.isDirectory()) continue
+    for (const model of await fs.promises.readdir(path.join(HF_CACHE, org.name), { withFileTypes: true })) {
+      if (!model.isDirectory()) continue
+      const id = `${org.name}/${model.name}`
+      found.push({ id, name: id, downloaded: true, sizeBytes: await dirSize(path.join(HF_CACHE, org.name, model.name)).catch(() => 0) })
     }
-    return found
-  } catch (err) {
-    console.error('hf:listLocal failed:', err)
-    return []
+  }
+  return found
+}
+
+const hfWorkerPath = () => path.join(__dirname, 'hf-worker.js')
+const downloading = new Map<string, AbortController>()
+
+ipcMain.handle('hf:listLocal', async () => {
+  try { return await listDownloadedModels() } catch (err) { console.error('hf:listLocal failed:', err); return [] }
+})
+
+/** Text-generation models that the ONNX runtime can run (tag `transformers.js`). */
+ipcMain.handle('hf:search', async (_e, query: string) => {
+  const q = typeof query === 'string' ? query.trim().slice(0, 100) : ''
+  const url = new URL('https://huggingface.co/api/models')
+  url.searchParams.set('filter', 'transformers.js')
+  url.searchParams.set('pipeline_tag', 'text-generation')
+  url.searchParams.set('sort', 'downloads')
+  url.searchParams.set('direction', '-1')
+  url.searchParams.set('limit', '30')
+  if (q) url.searchParams.set('search', q)
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) })
+  if (!res.ok) throw new Error(`Hugging Face search failed: HTTP ${res.status}`)
+  const data = (await res.json()) as { id: string; downloads?: number; likes?: number }[]
+  return data.filter((m) => isValidModelId(m.id)).map((m) => ({ id: m.id, downloads: m.downloads ?? 0, likes: m.likes ?? 0 }))
+})
+
+ipcMain.handle('hf:download', async (event, modelId: string) => {
+  if (!isValidModelId(modelId)) throw new Error('Некорректный id модели (ожидается org/name)')
+  if (downloading.has(modelId)) throw new Error('Модель уже скачивается')
+  const controller = new AbortController()
+  downloading.set(modelId, controller)
+  const sender = event.sender
+  const sendProgress = (p: DownloadProgress) => { if (!sender.isDestroyed()) sender.send('hf:progress', { modelId, ...p }) }
+  try {
+    await fs.promises.mkdir(HF_CACHE, { recursive: true })
+    for await (const chunk of runLocalModel({ workerPath: hfWorkerPath(), cacheDir: HF_CACHE, model: modelId, mode: 'download', onProgress: sendProgress, signal: controller.signal })) {
+      if (chunk.type === 'error') throw new Error(chunk.error ?? 'Не удалось скачать модель')
+    }
+    if (controller.signal.aborted) throw new Error('Скачивание отменено')
+    sendProgress({ status: 'complete' })
+  } finally {
+    downloading.delete(modelId)
   }
 })
 
-ipcMain.handle('hf:download', async (_e, modelId: string) => {
-  if (!isValidModelId(modelId)) throw new Error('Invalid model id')
-  await fs.promises.mkdir(HF_CACHE, { recursive: true })
-  for await (const chunk of runLocalModel({ workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: modelId, mode: 'download' })) {
-    if (chunk.type === 'error') throw new Error(chunk.error ?? 'Download failed')
-  }
+ipcMain.handle('hf:cancelDownload', (_e, modelId: string) => { downloading.get(modelId)?.abort() })
+
+ipcMain.handle('hf:remove', async (_e, modelId: string) => {
+  if (!isValidModelId(modelId)) throw new Error('Некорректный id модели')
+  const root = path.resolve(HF_CACHE)
+  const target = path.resolve(root, modelId)
+  if (!target.startsWith(root + path.sep)) throw new Error('Некорректный путь')
+  await fs.promises.rm(target, { recursive: true, force: true })
 })
 
 // ---- auto-updater ----------------------------------------------------------

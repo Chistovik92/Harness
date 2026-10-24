@@ -6,11 +6,14 @@
 import { Worker } from 'node:worker_threads'
 import type { ChatChunk } from '../renderer/lib/providers'
 
+export type DownloadProgress = { file?: string; loaded?: number; total?: number; status?: string }
+
 export type LocalRunOptions = {
   workerPath: string
   cacheDir: string
   model: string
-  prompt?: string
+  messages?: { role: string; content: string }[]
+  onProgress?: (progress: DownloadProgress) => void
   temperature?: number
   maxTokens?: number
   mode?: 'generate' | 'download'
@@ -38,14 +41,15 @@ export async function* runLocalModel(opts: LocalRunOptions): AsyncGenerator<Chat
     workerData: {
       mode: opts.mode ?? 'generate',
       model: opts.model,
-      prompt: opts.prompt ?? '',
+      messages: opts.messages ?? [],
       temperature: opts.temperature ?? 0.7,
       maxTokens: opts.maxTokens ?? 256,
       cacheDir: opts.cacheDir,
     },
   })
 
-  worker.on('message', (msg: ChatChunk) => {
+  worker.on('message', (msg: (ChatChunk | { type: 'progress' }) & DownloadProgress) => {
+    if (msg.type === 'progress') { opts.onProgress?.(msg); return }
     queue.push(msg)
     if (msg.type === 'done' || msg.type === 'error') finished = true
     notify()

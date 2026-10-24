@@ -51,6 +51,10 @@ export type ChatChunk = {
   streamId?: string
 }
 
+export type LocalModel = { id: string; name: string; downloaded: boolean; sizeBytes: number }
+export type HubModel = { id: string; downloads: number; likes: number }
+export type DownloadProgress = { modelId: string; file?: string; loaded?: number; total?: number; status?: string }
+
 export type StreamOptions = {
   model: string
   messages: { role: string; content: string }[]
@@ -82,8 +86,12 @@ type DshApi = {
     onChunk: (cb: (chunk: ChatChunk & { streamId: string }) => void) => () => void
   }
   hf: {
-    listLocal: () => Promise<{ id: string; name: string; downloaded: boolean }[]>
+    listLocal: () => Promise<LocalModel[]>
+    search: (query: string) => Promise<HubModel[]>
     download: (modelId: string) => Promise<void>
+    cancelDownload: (modelId: string) => Promise<void>
+    remove: (modelId: string) => Promise<void>
+    onProgress: (cb: (p: DownloadProgress) => void) => () => void
   }
   window: {
     openSettings: () => Promise<void>
@@ -129,7 +137,11 @@ const api: DshApi = {
   },
   hf: {
     listLocal: () => ipcRenderer.invoke('hf:listLocal'),
+    search: (query) => ipcRenderer.invoke('hf:search', query),
     download: (modelId) => ipcRenderer.invoke('hf:download', modelId),
+    cancelDownload: (modelId) => ipcRenderer.invoke('hf:cancelDownload', modelId),
+    remove: (modelId) => ipcRenderer.invoke('hf:remove', modelId),
+    onProgress: (cb) => subscribe('hf:progress', cb),
   },
   window: {
     openSettings: () => ipcRenderer.invoke('window:openSettings'),

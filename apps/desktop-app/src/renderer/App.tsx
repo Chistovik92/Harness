@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Send, Minimize, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
+import { Send, Download, Minimize, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
 import { useDsh } from '@/context/DshContext'
 import { useChat } from '@/context/ChatContext'
 import type { ModelInfo } from '../electron/preload'
 import { renderMarkdown } from '@/lib/markdown'
 import SettingsPage from './SettingsPage'
 import ProvidersPage, { mergeProviders } from './ProvidersPage'
+import ModelsPage from './ModelsPage'
 import { useUpdate } from '@/context/UpdateContext'
 
 type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number }
@@ -18,7 +19,7 @@ export default function App() {
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [selectedModel, setSelectedModel] = useState<string>('')
-  const [view, setView] = useState<'chat' | 'settings' | 'providers'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
+  const [view, setView] = useState<'chat' | 'settings' | 'providers' | 'models'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
   const { downloaded: updateDownloaded, install: installUpdate } = useUpdate()
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -137,6 +138,18 @@ export default function App() {
     )
   }
 
+  if (view === 'models') {
+    return (
+      <div className="h-screen flex flex-col bg-slate-900 text-slate-100 overflow-hidden">
+        <div className="flex items-center justify-between h-10 px-4 bg-slate-900/80 border-b border-slate-800 shrink-0 z-10">
+          <button onClick={() => setView('chat')} className="w-8 h-8 rounded hover:bg-slate-800 flex items-center justify-center text-slate-300 hover:text-white"><X className="w-4 h-4" /></button>
+          <span className="text-sm font-medium tracking-tight ml-2">Локальные модели</span>
+        </div>
+        <div className="flex-1 overflow-y-auto"><ModelsPage onBack={() => { setView('chat') }} /></div>
+      </div>
+    )
+  }
+
   if (view === 'providers') {
     return (
       <div className="h-screen flex flex-col bg-slate-900 text-slate-100 overflow-hidden">
@@ -229,6 +242,7 @@ export default function App() {
 
           <div className="mt-auto p-3 border-t border-slate-800 space-y-2">
             <button onClick={() => setView('settings')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><SettingsIcon className="w-4 h-4" /> Настройки</button>
+            <button onClick={() => setView('models')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Download className="w-4 h-4" /> Локальные модели</button>
             <button onClick={() => setView('providers')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Key className="w-4 h-4" /> Провайдеры API</button>
           </div>
         </aside>
