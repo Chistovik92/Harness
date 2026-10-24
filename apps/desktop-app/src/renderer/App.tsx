@@ -1,29 +1,43 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { Send, Download, Minimize, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
+import { Send, Download, Minimize, Folder, ShieldCheck, Server as ServerIcon, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
 import { useDsh } from '@/context/DshContext'
 import { useChat } from '@/context/ChatContext'
-import type { ModelInfo } from '../electron/preload'
+import type { ModelInfo, ToolStep } from '../electron/preload'
 import { renderMarkdown } from '@/lib/markdown'
 import SettingsPage from './SettingsPage'
 import ProvidersPage, { mergeProviders } from './ProvidersPage'
 import ModelsPage from './ModelsPage'
+import ConnectionsPage from './ConnectionsPage'
+import { PermissionDialog, ToolSteps } from '@/components/AgentUi'
+import { ModelProfileCard } from '@/components/ModelBadges'
 import { useUpdate } from '@/context/UpdateContext'
 
-type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number }
+type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number; steps?: ToolStep[] }
 
 export default function App() {
-  const { settings, isConnected, setIsConnected } = useDsh()
-  const { messages, addMessage, persistMessage, appendStream, isLoading, setIsLoading, currentSessionId, createSession, sessions, switchSession, deleteSession, setMessages } = useChat()
+  const { settings, saveSettings, isConnected, setIsConnected } = useDsh()
+  const { messages, addMessage, persistMessage, addStep, finishStep, appendStream, isLoading, setIsLoading, currentSessionId, createSession, sessions, switchSession, deleteSession, setMessages } = useChat()
 
   const [providers, setProviders] = useState<any[]>([])
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [selectedModel, setSelectedModel] = useState<string>('')
-  const [view, setView] = useState<'chat' | 'settings' | 'providers' | 'models'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
+  const [view, setView] = useState<'chat' | 'settings' | 'providers' | 'models' | 'connections'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
   const { downloaded: updateDownloaded, install: installUpdate } = useUpdate()
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const streamIdRef = useRef<string | null>(null)
+  const [agentMode, setAgentMode] = useState<boolean>(() => {
+    try { return localStorage.getItem('dsh-agent-mode') === '1' } catch { return false }
+  })
+  const toggleAgent = (on: boolean) => {
+    setAgentMode(on)
+    try { localStorage.setItem('dsh-agent-mode', on ? '1' : '0') } catch { /* storage unavailable */ }
+  }
+  const pickWorkspace = async () => {
+    const folder = await window.__DSH__.agent.pickWorkspace()
+    if (folder) await saveSettings({ workspace: folder })
+  }
   const [input, setInput] = useState('')
   const [streamId, setStreamId] = useState<string | null>(null)
   const abortRef = useRef<(() => void) | null>(null)
@@ -70,7 +84,11 @@ export default function App() {
       const id = streamIdRef.current
       if (!id || chunk.streamId !== id) return
       if (chunk.type === 'text' && chunk.content) appendStream(id, chunk.content)
-      else if (chunk.type === 'error') {
+      else if (chunk.type === 'tool_start' && chunk.toolCall) {
+        addStep(id, { id: chunk.toolCall.id, name: chunk.toolCall.name, summary: chunk.summary ?? chunk.toolCall.name, arguments: chunk.toolCall.arguments, status: 'running' })
+      } else if (chunk.type === 'tool_result' && chunk.toolCallId) {
+        finishStep(id, chunk.toolCallId, chunk.output ?? '', chunk.isError === true)
+      } else if (chunk.type === 'error') {
         appendStream(id, `\n\nОшибка: ${chunk.error}`)
         finishStream(id)
       } else if (chunk.type === 'done') finishStream(id)
@@ -107,6 +125,7 @@ export default function App() {
         temperature: settings.temperature ?? 0.7,
         maxTokens: settings.maxTokens ?? 4096,
         signalId: assistantId,
+        agent: agentMode,
       })
       abortRef.current = stream.cancel
       await stream.done
@@ -139,6 +158,19 @@ export default function App() {
     )
   }
 
+  if (view === 'connections') {
+    return (
+      <div className="h-screen flex flex-col bg-slate-900 text-slate-100 overflow-hidden">
+        <div className="flex items-center justify-between h-10 px-4 bg-slate-900/80 border-b border-slate-800 shrink-0 z-10">
+          <button onClick={() => setView('chat')} className="w-8 h-8 rounded hover:bg-slate-800 flex items-center justify-center text-slate-300 hover:text-white"><X className="w-4 h-4" /></button>
+          <span className="text-sm font-medium tracking-tight ml-2">SSH-подключения</span>
+        </div>
+        <div className="flex-1 overflow-y-auto"><ConnectionsPage onBack={() => setView('chat')} /></div>
+        <PermissionDialog />
+      </div>
+    )
+  }
+
   if (view === 'models') {
     return (
       <div className="h-screen flex flex-col bg-slate-900 text-slate-100 overflow-hidden">
@@ -147,6 +179,7 @@ export default function App() {
           <span className="text-sm font-medium tracking-tight ml-2">Локальные модели</span>
         </div>
         <div className="flex-1 overflow-y-auto"><ModelsPage onBack={() => { setView('chat') }} /></div>
+        <PermissionDialog />
       </div>
     )
   }
@@ -187,8 +220,10 @@ export default function App() {
         </div>
       )}
 
+      <PermissionDialog />
+
       <div className="flex-1 flex overflow-hidden">
-        <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0">
+        <aside className="w-72 bg-slate-950 border-r border-slate-800 flex flex-col shrink-0 overflow-y-auto">
           <div className="p-4 border-b border-slate-800">
             <div className="flex items-center gap-2 mb-2">
               <Bot className="w-4 h-4 text-indigo-400" />
@@ -226,6 +261,33 @@ export default function App() {
             {isLocalProvider && models.length === 0 && (
               <div className="mt-2 px-1 text-xs text-amber-200">Нет скачанных моделей. Скачайте их в разделе «Локальные модели».</div>
             )}
+            <ModelProfileCard profile={models.find((m) => m.id === selectedModel)?.profile} />
+          </div>
+
+          <div className="p-3 border-b border-slate-800 space-y-2">
+            <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+              <input type="checkbox" checked={agentMode} onChange={(e) => toggleAgent(e.target.checked)} className="w-4 h-4 rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-indigo-500" />
+              <ShieldCheck className="w-4 h-4 text-indigo-300" /> Режим агента
+            </label>
+            <div className="text-xs text-slate-500">Файлы, поиск, команды, веб и SSH. Работает с моделями API и GGUF.</div>
+            {agentMode && (
+              <>
+                <button onClick={pickWorkspace} className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 text-xs text-slate-300 text-left" title={settings.workspace ?? ''}>
+                  <Folder className="w-3.5 h-3.5 shrink-0" /><span className="truncate">{settings.workspace ?? 'Выбрать рабочую папку'}</span>
+                </button>
+                <select
+                  value={settings.permissionMode ?? 'workspace-auto'}
+                  onChange={(e) => saveSettings({ permissionMode: e.target.value as 'ask-all' | 'workspace-auto' | 'full-auto' })}
+                  aria-label="Режим разрешений"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="workspace-auto">Авто в рабочей папке, остальное спрашивать</option>
+                  <option value="ask-all">Спрашивать всё</option>
+                  <option value="full-auto">Всё автоматически (рискованно)</option>
+                </select>
+                {!settings.workspace && <div className="text-xs text-amber-200">Без рабочей папки команды и правки файлов будут запрашивать разрешение.</div>}
+              </>
+            )}
           </div>
 
           <div className="p-2">
@@ -246,6 +308,7 @@ export default function App() {
 
           <div className="mt-auto p-3 border-t border-slate-800 space-y-2">
             <button onClick={() => setView('settings')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><SettingsIcon className="w-4 h-4" /> Настройки</button>
+            <button onClick={() => setView('connections')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><ServerIcon className="w-4 h-4" /> SSH-подключения</button>
             <button onClick={() => setView('models')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Download className="w-4 h-4" /> Локальные модели</button>
             <button onClick={() => setView('providers')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Key className="w-4 h-4" /> Провайдеры API</button>
           </div>
@@ -261,6 +324,7 @@ export default function App() {
                       <span className={m.role === 'user' ? 'text-indigo-200 text-xs font-medium' : 'text-slate-400 text-xs font-medium'}>{m.role === 'user' ? 'Вы' : currentProvider?.name || 'Ассистент'}</span>
                       {m.role === 'assistant' && streamId && streamId === m.id && <span className="text-xs text-slate-500 animate-pulse">пишет…</span>}
                     </div>
+                    <ToolSteps steps={m.steps} />
                     <div dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} className="prose prose-sm prose-invert max-w-none" />
                   </div>
                 </div>

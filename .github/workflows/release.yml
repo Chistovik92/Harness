@@ -74,6 +74,34 @@ jobs:
         working-directory: apps/desktop-app
         run: npm run build
 
+      # llama.cpp binaries come as per-platform packages. A runner only installs its own,
+      # but mac/linux builds target two architectures, so fetch both; drop CUDA builds
+      # (hundreds of MB, need a CUDA toolkit anyway) and every other OS.
+      - name: Prepare llama.cpp binaries
+        shell: bash
+        working-directory: apps/desktop-app
+        run: |
+          [ -d node_modules/node-llama-cpp ] || exit 0
+          ver=$(node -p "JSON.parse(require('fs').readFileSync('node_modules/node-llama-cpp/package.json','utf8')).version")
+          case "$RUNNER_OS" in
+            macOS) want="mac-x64 mac-arm64-metal" ;;
+            Linux) want="linux-x64 linux-x64-vulkan linux-arm64" ;;
+            *) want="" ;;
+          esac
+          for name in $want; do
+            [ -d "node_modules/@node-llama-cpp/$name" ] || npm install --no-save --force --no-audit --no-fund "@node-llama-cpp/$name@$ver"
+          done
+          case "$RUNNER_OS" in Windows) os=win ;; macOS) os=mac ;; *) os=linux ;; esac
+          for d in node_modules/@node-llama-cpp/*/; do
+            n=$(basename "$d")
+            case "$n" in
+              *cuda*|*armv7l*|*riscv64*) rm -rf "$d" ;;
+              "$os"-*) ;;
+              *) rm -rf "$d" ;;
+            esac
+          done
+          ls node_modules/@node-llama-cpp
+
       # onnxruntime-node ships binaries for every OS (>200 MB); keep only this runner's.
       - name: Prune foreign ONNX runtime binaries
         shell: bash

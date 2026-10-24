@@ -9,7 +9,7 @@ const csp = {
   apply: 'build' as const,
   transformIndexHtml: () => [{
     tag: 'meta',
-    attrs: { 'http-equiv': 'Content-Security-Policy', content: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'" },
+    attrs: { 'http-equiv': 'Content-Security-Policy', content: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn-avatars.huggingface.co https://huggingface.co; connect-src 'self'" },
     injectTo: 'head-prepend' as const,
   }],
 }

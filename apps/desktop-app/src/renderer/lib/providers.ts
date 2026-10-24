@@ -19,11 +19,31 @@ export type ProviderKind =
   | 'huggingface-api'
   | 'huggingface-local'
 
+/** A function the model may call; `parameters` is a JSON Schema object. */
+export type ToolDef = {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+}
+
+export type ToolCall = {
+  id: string
+  name: string
+  arguments: Record<string, unknown>
+}
+
 export type Message = {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string
+  /** Tool name, set on `tool` messages. */
   name?: string
+  /** Calls requested by the assistant in this turn. */
+  toolCalls?: ToolCall[]
+  /** Id of the call a `tool` message answers. */
+  toolCallId?: string
 }
+
+import type { ModelProfile } from './modelProfile'
 
 export type ModelInfo = {
   id: string
@@ -33,6 +53,7 @@ export type ModelInfo = {
   contextWindow?: number
   local?: boolean        // true if model runs locally (HF local)
   downloaded?: boolean   // HF local model present on disk
+  profile?: ModelProfile // Russian-language quality, strengths, size
 }
 
 export type ProviderConfig = {
@@ -52,12 +73,14 @@ export type ChatOptions = {
   maxTokens?: number
   stream?: boolean
   signal?: AbortSignal
+  tools?: ToolDef[]
 }
 
 export type ChatChunk = {
-  type: 'text' | 'done' | 'error'
+  type: 'text' | 'done' | 'error' | 'tool_calls'
   content?: string
   error?: string
+  toolCalls?: ToolCall[]
 }
 
 export abstract class LLMProvider {

@@ -20,7 +20,7 @@ export type LocalRunOptions = {
   signal?: AbortSignal
 }
 
-const HF_MODEL_ID = /^[\w.-]+\/[\w.-]+$/
+const HF_MODEL_ID = /^(?!\.{1,2}\/)[\w.-]+\/(?!\.{1,2}$)[\w.-]+$/
 
 export function isValidModelId(id: unknown): id is string {
   return typeof id === 'string' && HF_MODEL_ID.test(id)

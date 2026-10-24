@@ -19,7 +19,16 @@ import { HuggingFaceProvider } from '../renderer/lib/huggingfaceProvider'
 import { providerRegistry } from '../renderer/lib/registry'
 import type { LLMProvider, ProviderKind, Message, ChatChunk } from '../renderer/lib/providers'
 import { encrypt, decrypt, generateKey, isValidKey } from './secureStore'
-import { runLocalModel, isValidModelId, type DownloadProgress } from './localHf'
+import { runLocalModel } from './localHf'
+import { GgufEngine } from './gguf'
+import { registerModelIpc, isGgufModelId } from './ipcModels'
+import { registerAgentIpc, isPermissionMode, validWorkspace } from './ipcAgent'
+import { HfAuth, type StoredAuth } from './hfAuth'
+import { EncryptedStore } from './store'
+import type { SshConnection } from './agent/remote'
+import type { PermissionMode } from './agent/permissions'
+import { runAgent, executeTool, toolDefs, summarizeCall, buildSystemPrompt, type AgentEvent } from './agent/loop'
+import { buildProfile } from '../renderer/lib/modelProfile'
 
 // ---- providers -------------------------------------------------------------
 type StoredProvider = {
@@ -281,6 +290,16 @@ function mutateProviders<T>(fn: (list: StoredProvider[]) => { list: StoredProvid
   return run
 }
 
+// ---- models, sign-in and agent environment ---------------------------------
+const GGUF_DIR = path.join(USER_DATA, 'gguf')
+const hfAuth = new HfAuth(
+  new EncryptedStore<StoredAuth>(path.join(USER_DATA, 'hf-auth.enc.json'), storageKey, () => null),
+  (url) => shell.openExternal(url),
+)
+const ggufEngine = new GgufEngine(path.join(__dirname, 'gguf-worker.js'))
+const modelIpc = registerModelIpc({ ggufDir: GGUF_DIR, onnxCache: HF_CACHE, workerPath: path.join(__dirname, 'hf-worker.js'), auth: hfAuth })
+const agentIpc = registerAgentIpc(new EncryptedStore<SshConnection[]>(path.join(USER_DATA, 'connections.enc.json'), storageKey, () => []))
+
 // ---- validation ------------------------------------------------------------
 const isHttpUrl = (v: string) => { try { return /^https?:$/.test(new URL(v).protocol) } catch { return false } }
 const str = (v: unknown, max: number): string | undefined => (typeof v === 'string' && v.length > 0 ? v.slice(0, max) : undefined)
@@ -302,8 +321,8 @@ function parseProvider(raw: any): StoredProvider {
 }
 
 // ---- settings persistence --------------------------------------------------
-type Settings = { apiKey?: string; baseUrl?: string; model?: string; temperature?: number; maxTokens?: number; theme?: 'light' | 'dark'; fontSize?: number }
-const DEFAULT_SETTINGS: Settings = { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', temperature: 0.7, maxTokens: 4096, theme: 'dark', fontSize: 14 }
+type Settings = { apiKey?: string; baseUrl?: string; model?: string; temperature?: number; maxTokens?: number; theme?: 'light' | 'dark'; fontSize?: number; workspace?: string; permissionMode?: PermissionMode }
+const DEFAULT_SETTINGS: Settings = { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', temperature: 0.7, maxTokens: 4096, theme: 'dark', fontSize: 14, permissionMode: 'workspace-auto' }
 const DEEPSEEK_ID = 'deepseek'
 
 function readSettingsFile(): Settings {
@@ -356,6 +375,8 @@ async function saveSettings(raw: any): Promise<Settings> {
     ...(raw?.maxTokens !== undefined ? { maxTokens: Math.round(clamp(raw.maxTokens, 1, 131072, 4096)) } : {}),
     ...(raw?.theme === 'light' || raw?.theme === 'dark' ? { theme: raw.theme } : {}),
     ...(raw?.fontSize !== undefined ? { fontSize: Math.round(clamp(raw.fontSize, 8, 32, 14)) } : {}),
+    ...(raw && 'workspace' in raw ? { workspace: validWorkspace(raw.workspace) ?? undefined } : {}),
+    ...(isPermissionMode(raw?.permissionMode) ? { permissionMode: raw.permissionMode } : {}),
   }
   writeSettingsFile(next)
   if (raw && 'apiKey' in raw) await setDeepseekKey(str(raw.apiKey, 500))
@@ -391,9 +412,11 @@ ipcMain.handle('providers:listModels', async (_e, providerId: string) => {
     id: provider.id, name: provider.name, kind: provider.kind,
     apiKey: cfg?.apiKey, baseUrl: cfg?.baseUrl, defaultModel: cfg?.defaultModel, enabled: cfg?.enabled !== false,
   })
-  if (provider.kind !== 'huggingface-local') return models
+  if (provider.kind !== 'huggingface-local') {
+    return models.map((m) => ({ ...m, profile: m.profile ?? buildProfile({ id: m.id, runtime: 'cloud', contextLength: m.contextWindow }) }))
+  }
   // Only models that are on disk can be chatted with; others are fetched on the models page.
-  return (await listDownloadedModels().catch(() => [])).map((m) => ({ id: m.id, name: m.id, provider: provider.id, kind: provider.kind, local: true, downloaded: true }))
+  return (await modelIpc.listLocalModels()).map((m) => ({ id: m.id, name: m.name, provider: provider.id, kind: provider.kind, local: true, downloaded: true, profile: m.profile }))
 })
 
 ipcMain.handle('dialog:openFile', async () => {
@@ -415,7 +438,7 @@ ipcMain.handle('window:minimize', () => mainWindow?.minimize())
 const MAX_MESSAGES = 500
 const ROLES = new Set(['system', 'user', 'assistant'])
 
-type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string }
+type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string; agent: boolean }
 
 function parseChatRequest(raw: any): ChatRequest {
   const providerId = str(raw?.providerId, 100)
@@ -430,7 +453,7 @@ function parseChatRequest(raw: any): ChatRequest {
     .map((m: any) => ({ role: m.role, content: m.content }))
   if (messages.length === 0) throw new Error('No non-empty messages to send')
   return {
-    providerId, model, messages, signalId,
+    providerId, model, messages, signalId, agent: raw.agent === true,
     temperature: clamp(raw.temperature, 0, 2, 0.7),
     maxTokens: Math.round(clamp(raw.maxTokens, 1, 131072, 4096)),
   }
@@ -441,34 +464,65 @@ ipcMain.handle('chat:stream', async (event, raw) => {
   if (activeStreams.has(req.signalId)) throw new Error('Stream id already in use')
 
   const saved = (await readProviders()).find((x) => x.id === req.providerId)
-  const cfg = saved ?? builtinConfig(req.providerId)
+  let cfg = saved ?? builtinConfig(req.providerId)
+  // Hugging Face's hosted API works with the signed-in account, no token needed.
+  if (!cfg && req.providerId === 'huggingface-api') cfg = { id: 'huggingface-api', name: 'Hugging Face (API)', kind: 'huggingface-api', enabled: true }
   if (!cfg || cfg.enabled === false) throw new Error(`Provider ${req.providerId} is not configured or disabled`)
   const provider = resolveProvider(cfg)
   if (!provider) throw new Error(`Provider ${req.providerId} not found`)
+  const apiKey = cfg.apiKey || (cfg.kind === 'huggingface-api' ? (await hfAuth.getToken()) ?? undefined : undefined)
+  const providerConfig = { id: cfg.id, name: cfg.name, kind: cfg.kind, enabled: true, apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel }
 
   const controller = new AbortController()
   activeStreams.set(req.signalId, controller)
   const sender = event.sender
-  const send = (chunk: ChatChunk) => {
+  const send = (chunk: Record<string, unknown>) => {
     if (!sender.isDestroyed()) sender.send('chat:chunk', { streamId: req.signalId, ...chunk })
+  }
+  const sendEvent = (e: AgentEvent) => {
+    if (e.type === 'text') { if (e.content) send({ type: 'text', content: e.content }) } else send(e)
   }
 
   try {
-    const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
-      ? runLocalModel({
-          workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
-          messages: req.messages, temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
-          signal: controller.signal,
-        })
-      : provider.chat({
-          model: req.model, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens,
-          signal: controller.signal,
-          config: { id: cfg.id, name: cfg.name, kind: cfg.kind, enabled: true, apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel },
-        })
+    const settings = await loadSettings()
+    const workspace = validWorkspace(settings.workspace)
+    const ggufPath = isGgufModelId(req.model) ? modelIpc.ggufPath(req.model) : null
+    if (isGgufModelId(req.model) && (!ggufPath || !fs.existsSync(ggufPath))) throw new Error('Модель GGUF не найдена на диске: скачайте её в разделе «Локальные модели»')
 
-    for await (const chunk of stream) {
-      if (chunk.type === 'text' && chunk.content) send(chunk)
-      else if (chunk.type === 'error') { send(chunk); break }
+    if (req.agent) {
+      if (isLocalHf(cfg) && !ggufPath) throw new Error('Агентный режим недоступен для ONNX-моделей: скачайте GGUF-модель или используйте провайдера с API')
+      const ctx = agentIpc.createContext(sender, workspace, settings.permissionMode ?? 'workspace-auto', controller.signal)
+      try {
+        if (ggufPath) {
+          const messages = [{ role: 'system' as const, content: buildSystemPrompt(workspace) }, ...req.messages]
+          for await (const e of ggufEngine.chat({
+            modelPath: ggufPath, messages, tools: toolDefs(), temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal,
+            runTool: (call) => executeTool(call.name, call.arguments, ctx), summarize: summarizeCall,
+          })) { sendEvent(e); if (e.type === 'error') break }
+        } else {
+          await runAgent({ provider, config: providerConfig, model: req.model, history: req.messages, ctx, temperature: req.temperature, maxTokens: req.maxTokens, onEvent: sendEvent })
+        }
+      } finally {
+        ctx.remote.closeAll()
+      }
+    } else if (ggufPath) {
+      for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal })) {
+        sendEvent(e)
+        if (e.type === 'error') break
+      }
+    } else {
+      const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
+        ? runLocalModel({
+            workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
+            messages: req.messages, temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
+            signal: controller.signal,
+          })
+        : provider.chat({ model: req.model, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, config: providerConfig })
+
+      for await (const chunk of stream) {
+        if (chunk.type === 'text' && chunk.content) send(chunk)
+        else if (chunk.type === 'error') { send(chunk); break }
+      }
     }
   } catch (err) {
     if (!controller.signal.aborted) send({ type: 'error', error: err instanceof Error ? err.message : String(err) })
@@ -479,85 +533,6 @@ ipcMain.handle('chat:stream', async (event, raw) => {
 })
 
 ipcMain.handle('chat:cancel', (_e, signalId: string) => { activeStreams.get(signalId)?.abort() })
-
-// ---- IPC: local Hugging Face models ----------------------------------------
-type LocalModel = { id: string; name: string; downloaded: boolean; sizeBytes: number }
-
-async function dirSize(dir: string): Promise<number> {
-  let total = 0
-  for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name)
-    total += entry.isDirectory() ? await dirSize(full) : (await fs.promises.stat(full)).size
-  }
-  return total
-}
-
-/** Models already in the cache, laid out as <cache>/<org>/<name>. */
-async function listDownloadedModels(): Promise<LocalModel[]> {
-  if (!fs.existsSync(HF_CACHE)) return []
-  const found: LocalModel[] = []
-  for (const org of await fs.promises.readdir(HF_CACHE, { withFileTypes: true })) {
-    if (!org.isDirectory()) continue
-    for (const model of await fs.promises.readdir(path.join(HF_CACHE, org.name), { withFileTypes: true })) {
-      if (!model.isDirectory()) continue
-      const id = `${org.name}/${model.name}`
-      found.push({ id, name: id, downloaded: true, sizeBytes: await dirSize(path.join(HF_CACHE, org.name, model.name)).catch(() => 0) })
-    }
-  }
-  return found
-}
-
-const hfWorkerPath = () => path.join(__dirname, 'hf-worker.js')
-const downloading = new Map<string, AbortController>()
-
-ipcMain.handle('hf:listLocal', async () => {
-  try { return await listDownloadedModels() } catch (err) { console.error('hf:listLocal failed:', err); return [] }
-})
-
-/** Text-generation models that the ONNX runtime can run (tag `transformers.js`). */
-ipcMain.handle('hf:search', async (_e, query: string) => {
-  const q = typeof query === 'string' ? query.trim().slice(0, 100) : ''
-  const url = new URL('https://huggingface.co/api/models')
-  url.searchParams.set('filter', 'transformers.js')
-  url.searchParams.set('pipeline_tag', 'text-generation')
-  url.searchParams.set('sort', 'downloads')
-  url.searchParams.set('direction', '-1')
-  url.searchParams.set('limit', '30')
-  if (q) url.searchParams.set('search', q)
-  const res = await fetch(url, { signal: AbortSignal.timeout(15000) })
-  if (!res.ok) throw new Error(`Hugging Face search failed: HTTP ${res.status}`)
-  const data = (await res.json()) as { id: string; downloads?: number; likes?: number }[]
-  return data.filter((m) => isValidModelId(m.id)).map((m) => ({ id: m.id, downloads: m.downloads ?? 0, likes: m.likes ?? 0 }))
-})
-
-ipcMain.handle('hf:download', async (event, modelId: string) => {
-  if (!isValidModelId(modelId)) throw new Error('Некорректный id модели (ожидается org/name)')
-  if (downloading.has(modelId)) throw new Error('Модель уже скачивается')
-  const controller = new AbortController()
-  downloading.set(modelId, controller)
-  const sender = event.sender
-  const sendProgress = (p: DownloadProgress) => { if (!sender.isDestroyed()) sender.send('hf:progress', { modelId, ...p }) }
-  try {
-    await fs.promises.mkdir(HF_CACHE, { recursive: true })
-    for await (const chunk of runLocalModel({ workerPath: hfWorkerPath(), cacheDir: HF_CACHE, model: modelId, mode: 'download', onProgress: sendProgress, signal: controller.signal })) {
-      if (chunk.type === 'error') throw new Error(chunk.error ?? 'Не удалось скачать модель')
-    }
-    if (controller.signal.aborted) throw new Error('Скачивание отменено')
-    sendProgress({ status: 'complete' })
-  } finally {
-    downloading.delete(modelId)
-  }
-})
-
-ipcMain.handle('hf:cancelDownload', (_e, modelId: string) => { downloading.get(modelId)?.abort() })
-
-ipcMain.handle('hf:remove', async (_e, modelId: string) => {
-  if (!isValidModelId(modelId)) throw new Error('Некорректный id модели')
-  const root = path.resolve(HF_CACHE)
-  const target = path.resolve(root, modelId)
-  if (!target.startsWith(root + path.sep)) throw new Error('Некорректный путь')
-  await fs.promises.rm(target, { recursive: true, force: true })
-})
 
 // ---- auto-updater ----------------------------------------------------------
 type Updater = typeof import('electron-updater').autoUpdater
@@ -603,6 +578,7 @@ if (!app.requestSingleInstanceLock()) {
 app.on('before-quit', () => {
   isQuitting = true
   activeStreams.forEach((c) => c.abort())
+  ggufEngine.dispose()
   if (tray) { tray.destroy(); tray = null }
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

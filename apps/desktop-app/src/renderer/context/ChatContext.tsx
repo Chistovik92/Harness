@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react'
-import type { ChatMessage } from '../../electron/preload'
+import type { ChatMessage, ToolStep } from '../../electron/preload'
 export type { ChatMessage }
 import {
   getSessions,
@@ -18,6 +18,8 @@ type ChatContext = {
   sessions: StoredSession[]
   addMessage: (msg: ChatMessage, sessionId?: string) => void
   persistMessage: (id: string) => void
+  addStep: (messageId: string, step: ToolStep) => void
+  finishStep: (messageId: string, stepId: string, output: string, isError: boolean) => void
   setMessages: (msgs: ChatMessage[]) => void
   appendStream: (id: string, chunk: string) => void
   createSession: () => Promise<string>
@@ -36,11 +38,11 @@ export function useChat() {
 }
 
 function toStored(m: ChatMessage, sessionId: string): StoredMessage {
-  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt }
+  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}) }
 }
 
 function toChat(m: StoredMessage): ChatMessage {
-  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt }
+  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}) }
 }
 
 export function ChatProvider({ children }: { children: React.ReactNode }) {
@@ -90,6 +92,16 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     )
   }, [])
 
+  const addStep = useCallback((messageId: string, step: ToolStep) => {
+    setMessages((prev) => prev.map((m: ChatMessage) => (m.id === messageId ? { ...m, steps: [...(m.steps ?? []), step] } : m)))
+  }, [])
+
+  const finishStep = useCallback((messageId: string, stepId: string, output: string, isError: boolean) => {
+    setMessages((prev) => prev.map((m: ChatMessage) => (m.id === messageId
+      ? { ...m, steps: (m.steps ?? []).map((s) => (s.id === stepId ? { ...s, status: isError ? 'error' as const : 'done' as const, output } : s)) }
+      : m)))
+  }, [])
+
   const createSession = useCallback(async () => {
     const id = crypto.randomUUID()
     const session: StoredSession = { id, title: 'Новый чат', updatedAt: Date.now() }
@@ -124,7 +136,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   }, [currentSessionId, sessions])
 
   return (
-    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, persistMessage, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
+    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, persistMessage, addStep, finishStep, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
       {children}
     </ChatContext.Provider>
   )

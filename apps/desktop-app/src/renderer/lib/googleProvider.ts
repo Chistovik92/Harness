@@ -2,10 +2,34 @@
  * Google (Gemini) provider.
  * Uses :streamGenerateContent with alt=sse; the API key is sent in a header,
  * never in the URL, so it cannot leak into logs or error messages.
+ * Supports function calling (functionDeclarations).
  */
 
-import { LLMProvider, type ProviderConfig, type ModelInfo, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
 import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
+
+type GeminiContent = { role: 'user' | 'model'; parts: Record<string, unknown>[] }
+
+/** Adjacent `tool` results are merged into a single user turn of functionResponse parts. */
+export function toGeminiContents(messages: Message[]): GeminiContent[] {
+  const out: GeminiContent[] = []
+  for (const m of messages) {
+    if (m.role === 'tool') {
+      const part = { functionResponse: { name: m.name ?? 'tool', response: { result: m.content } } }
+      const last = out[out.length - 1]
+      if (last?.role === 'user' && last.parts.every((p) => 'functionResponse' in p)) last.parts.push(part)
+      else out.push({ role: 'user', parts: [part] })
+    } else if (m.role === 'assistant') {
+      const parts: Record<string, unknown>[] = []
+      if (m.content) parts.push({ text: m.content })
+      for (const c of m.toolCalls ?? []) parts.push({ functionCall: { name: c.name, args: c.arguments } })
+      if (parts.length > 0) out.push({ role: 'model', parts })
+    } else if (m.role === 'user') {
+      out.push({ role: 'user', parts: [{ text: m.content }] })
+    }
+  }
+  return out
+}
 
 export class GoogleProvider extends LLMProvider {
   readonly id: ProviderId
@@ -29,7 +53,7 @@ export class GoogleProvider extends LLMProvider {
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {
-    const { config, model, messages, temperature = 0.7, maxTokens = 4096, signal } = opts
+    const { config, model, messages, temperature = 0.7, maxTokens = 4096, signal, tools } = opts
     if (!config.apiKey) {
       yield { type: 'error', error: 'API key not configured' }
       return
@@ -37,12 +61,13 @@ export class GoogleProvider extends LLMProvider {
 
     const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n')
     const body: Record<string, unknown> = {
-      contents: messages
-        .filter((m) => m.role === 'user' || m.role === 'assistant')
-        .map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+      contents: toGeminiContents(messages),
       generationConfig: { temperature, maxOutputTokens: maxTokens },
     }
     if (system) body.systemInstruction = { parts: [{ text: system }] }
+    if (tools?.length) {
+      body.tools = [{ functionDeclarations: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })) }]
+    }
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`
 
@@ -58,15 +83,21 @@ export class GoogleProvider extends LLMProvider {
         return
       }
 
+      const toolCalls: ToolCall[] = []
       for await (const payload of readSSE(res, signal)) {
         try {
-          const parts: { text?: string }[] = JSON.parse(payload).candidates?.[0]?.content?.parts ?? []
+          const parts: { text?: string; functionCall?: { name: string; args?: Record<string, unknown> } }[] =
+            JSON.parse(payload).candidates?.[0]?.content?.parts ?? []
           const text = parts.map((p) => p.text ?? '').join('')
           if (text) yield { type: 'text', content: text }
+          for (const p of parts) {
+            if (p.functionCall) toolCalls.push({ id: `call_${toolCalls.length}_${Date.now()}`, name: p.functionCall.name, arguments: p.functionCall.args ?? {} })
+          }
         } catch {
           // partial frame
         }
       }
+      if (toolCalls.length > 0) yield { type: 'tool_calls', toolCalls }
       yield { type: 'done' }
     } catch (err) {
       if (signal?.aborted || isAbortError(err)) {

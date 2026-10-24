@@ -4,6 +4,9 @@
  */
 
 import { contextBridge, ipcRenderer } from 'electron'
+import type { ModelProfile } from '../renderer/lib/modelProfile'
+
+export type { ModelProfile }
 
 export type Settings = {
   apiKey?: string
@@ -13,6 +16,8 @@ export type Settings = {
   maxTokens?: number
   theme?: 'light' | 'dark'
   fontSize?: number
+  workspace?: string
+  permissionMode?: 'ask-all' | 'workspace-auto' | 'full-auto'
 }
 
 export type ProviderConfig = {
@@ -35,6 +40,16 @@ export type ModelInfo = {
   contextWindow?: number
   local?: boolean
   downloaded?: boolean
+  profile?: ModelProfile
+}
+
+export type ToolStep = {
+  id: string
+  name: string
+  summary: string
+  arguments: Record<string, unknown>
+  status: 'running' | 'done' | 'error'
+  output?: string
 }
 
 export type ChatMessage = {
@@ -42,17 +57,46 @@ export type ChatMessage = {
   role: 'user' | 'assistant' | 'system'
   content: string
   createdAt: number
+  steps?: ToolStep[]
 }
 
+export type ToolCallInfo = { id: string; name: string; arguments: Record<string, unknown> }
+
 export type ChatChunk = {
-  type: 'text' | 'done' | 'error'
+  type: 'text' | 'done' | 'error' | 'tool_start' | 'tool_result'
   content?: string
   error?: string
   streamId?: string
+  toolCall?: ToolCallInfo
+  summary?: string
+  toolCallId?: string
+  name?: string
+  output?: string
+  isError?: boolean
 }
 
-export type LocalModel = { id: string; name: string; downloaded: boolean; sizeBytes: number }
-export type HubModel = { id: string; downloads: number; likes: number }
+export type PermissionRequest = { id: string; tool: string; summary: string; reason: string; details?: string }
+export type PermissionAnswer = 'once' | 'session' | 'deny'
+
+export type SshConnectionInfo = {
+  name: string
+  host: string
+  port: number
+  username: string
+  authType: 'password' | 'key' | 'agent'
+  privateKeyPath?: string
+  hostKey?: string
+  hasPassword: boolean
+  hasPassphrase: boolean
+}
+export type SshConnectionInput = Omit<SshConnectionInfo, 'hasPassword' | 'hasPassphrase' | 'hostKey'> & { password?: string; passphrase?: string }
+
+export type HfUser = { name: string; fullName?: string; avatar?: string }
+export type AuthStatus = { loggedIn: boolean; user?: HfUser }
+export type GgufFile = { file: string; size: number; quant: string; parts: string[] }
+
+export type LocalModel = { id: string; name: string; format: 'onnx' | 'gguf'; downloaded: boolean; sizeBytes: number; profile: ModelProfile }
+export type HubModel = { id: string; downloads: number; likes: number; gated: boolean; profile: ModelProfile }
 export type DownloadProgress = { modelId: string; file?: string; loaded?: number; total?: number; status?: string }
 
 export type StreamOptions = {
@@ -61,6 +105,7 @@ export type StreamOptions = {
   temperature?: number
   maxTokens?: number
   signalId: string
+  agent?: boolean
 }
 
 type DshApi = {
@@ -87,11 +132,27 @@ type DshApi = {
   }
   hf: {
     listLocal: () => Promise<LocalModel[]>
-    search: (query: string) => Promise<HubModel[]>
+    search: (format: 'onnx' | 'gguf', query: string) => Promise<HubModel[]>
+    ggufFiles: (repoId: string) => Promise<GgufFile[]>
     download: (modelId: string) => Promise<void>
+    downloadGguf: (repoId: string, file: string, parts: string[]) => Promise<void>
+    authStatus: () => Promise<AuthStatus>
+    login: () => Promise<AuthStatus>
+    logout: () => Promise<void>
     cancelDownload: (modelId: string) => Promise<void>
     remove: (modelId: string) => Promise<void>
     onProgress: (cb: (p: DownloadProgress) => void) => () => void
+  }
+  agent: {
+    pickWorkspace: () => Promise<string | null>
+    onPermission: (cb: (request: PermissionRequest) => void) => () => void
+    replyPermission: (id: string, answer: PermissionAnswer) => Promise<void>
+  }
+  ssh: {
+    list: () => Promise<SshConnectionInfo[]>
+    set: (connection: SshConnectionInput) => Promise<void>
+    remove: (name: string) => Promise<void>
+    test: (name: string) => Promise<{ ok: boolean; message: string }>
   }
   window: {
     openSettings: () => Promise<void>
@@ -137,11 +198,27 @@ const api: DshApi = {
   },
   hf: {
     listLocal: () => ipcRenderer.invoke('hf:listLocal'),
-    search: (query) => ipcRenderer.invoke('hf:search', query),
+    search: (format, query) => ipcRenderer.invoke('hf:search', format, query),
+    ggufFiles: (repoId) => ipcRenderer.invoke('hf:ggufFiles', repoId),
     download: (modelId) => ipcRenderer.invoke('hf:download', modelId),
+    downloadGguf: (repoId, file, parts) => ipcRenderer.invoke('hf:downloadGguf', repoId, file, parts),
+    authStatus: () => ipcRenderer.invoke('hf:authStatus'),
+    login: () => ipcRenderer.invoke('hf:login'),
+    logout: () => ipcRenderer.invoke('hf:logout'),
     cancelDownload: (modelId) => ipcRenderer.invoke('hf:cancelDownload', modelId),
     remove: (modelId) => ipcRenderer.invoke('hf:remove', modelId),
     onProgress: (cb) => subscribe('hf:progress', cb),
+  },
+  agent: {
+    pickWorkspace: () => ipcRenderer.invoke('agent:pickWorkspace'),
+    onPermission: (cb) => subscribe('agent:permission', cb),
+    replyPermission: (id, answer) => ipcRenderer.invoke('agent:permissionReply', { id, answer }),
+  },
+  ssh: {
+    list: () => ipcRenderer.invoke('ssh:list'),
+    set: (connection) => ipcRenderer.invoke('ssh:set', connection),
+    remove: (name) => ipcRenderer.invoke('ssh:remove', name),
+    test: (name) => ipcRenderer.invoke('ssh:test', name),
   },
   window: {
     openSettings: () => ipcRenderer.invoke('window:openSettings'),

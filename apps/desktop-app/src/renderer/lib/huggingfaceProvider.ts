@@ -50,7 +50,7 @@ export class HuggingFaceProvider extends LLMProvider {
       return
     }
     if (!opts.config.apiKey) {
-      yield { type: 'error', error: 'Hugging Face token not configured' }
+      yield { type: 'error', error: 'Войдите в аккаунт Hugging Face (раздел «Локальные модели») или добавьте токен в «Провайдеры API»' }
       return
     }
     yield* this.api.chat({ ...opts, config: { ...opts.config, baseUrl: HF_ROUTER_URL } })

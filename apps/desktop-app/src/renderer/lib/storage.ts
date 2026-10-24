@@ -3,6 +3,8 @@
  * Сессии и сообщения сохраняются на диск, выживают после перезапуска приложения.
  */
 
+import type { ToolStep } from '../../electron/preload'
+
 const DB_NAME = 'dsh-desktop'
 const DB_VERSION = 1
 
@@ -40,6 +42,7 @@ export type StoredMessage = {
   role: 'user' | 'assistant' | 'system'
   content: string
   createdAt: number
+  steps?: ToolStep[]
 }
 
 export async function getSessions(): Promise<StoredSession[]> {

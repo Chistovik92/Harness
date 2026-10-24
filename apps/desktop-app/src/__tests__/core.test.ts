@@ -151,6 +151,8 @@ describe('isValidModelId', () => {
   it('accepts org/name ids and rejects path traversal', () => {
     expect(isValidModelId('Xenova/gpt2')).toBe(true)
     expect(isValidModelId('../etc/passwd')).toBe(false)
+    expect(isValidModelId('../evil')).toBe(false)
+    expect(isValidModelId('org/..')).toBe(false)
     expect(isValidModelId('a/b/c')).toBe(false)
     expect(isValidModelId(42)).toBe(false)
   })

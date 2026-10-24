@@ -1,10 +1,35 @@
 /**
  * OpenAI-compatible provider (DeepSeek, OpenAI, Groq, Together, OpenRouter, etc.)
- * Uses the standard /v1/chat/completions endpoint with SSE streaming.
+ * Uses the standard /v1/chat/completions endpoint with SSE streaming and
+ * native tool calling.
  */
 
-import { LLMProvider, type ProviderConfig, type ModelInfo, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
+import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
 import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
+
+export function parseToolArguments(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+export function toOpenAIMessage(m: Message): Record<string, unknown> {
+  if (m.role === 'tool') return { role: 'tool', tool_call_id: m.toolCallId, content: m.content }
+  if (m.role === 'assistant' && m.toolCalls?.length) {
+    return {
+      role: 'assistant',
+      content: m.content || null,
+      tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.arguments) } })),
+    }
+  }
+  return { role: m.role, content: m.content, ...(m.name ? { name: m.name } : {}) }
+}
+
+type PartialCall = { id: string; name: string; args: string }
 
 export class OpenAICompatibleProvider extends LLMProvider {
   readonly id: ProviderId
@@ -30,19 +55,22 @@ export class OpenAICompatibleProvider extends LLMProvider {
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {
-    const { config, model, messages, temperature = 0.7, maxTokens = 4096, signal } = opts
+    const { config, model, messages, temperature = 0.7, maxTokens = 4096, signal, tools } = opts
     if (!config.apiKey) {
       yield { type: 'error', error: 'API key not configured' }
       return
     }
 
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/+$/, '')
-    const body = {
+    const body: Record<string, unknown> = {
       model,
-      messages: messages.map((m) => ({ role: m.role, content: m.content, ...(m.name ? { name: m.name } : {}) })),
+      messages: messages.map(toOpenAIMessage),
       temperature,
       max_tokens: maxTokens,
       stream: true,
+    }
+    if (tools?.length) {
+      body.tools = tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }))
     }
 
     try {
@@ -57,14 +85,29 @@ export class OpenAICompatibleProvider extends LLMProvider {
         return
       }
 
+      const calls = new Map<number, PartialCall>()
       for await (const payload of readSSE(res, signal)) {
         if (payload === '[DONE]') break
         try {
-          const delta = JSON.parse(payload).choices?.[0]?.delta?.content ?? ''
-          if (delta) yield { type: 'text', content: delta }
+          const delta = JSON.parse(payload).choices?.[0]?.delta
+          if (delta?.content) yield { type: 'text', content: delta.content }
+          for (const tc of delta?.tool_calls ?? []) {
+            const slot = calls.get(tc.index ?? 0) ?? { id: '', name: '', args: '' }
+            if (tc.id) slot.id = tc.id
+            if (tc.function?.name) slot.name += tc.function.name
+            if (tc.function?.arguments) slot.args += tc.function.arguments
+            calls.set(tc.index ?? 0, slot)
+          }
         } catch {
           // keep-alive or partial frame
         }
+      }
+
+      if (calls.size > 0) {
+        const toolCalls: ToolCall[] = [...calls.entries()]
+          .sort(([a], [b]) => a - b)
+          .map(([i, c]) => ({ id: c.id || `call_${i}_${Date.now()}`, name: c.name, arguments: parseToolArguments(c.args) }))
+        yield { type: 'tool_calls', toolCalls }
       }
       yield { type: 'done' }
     } catch (err) {
