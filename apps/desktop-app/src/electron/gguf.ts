@@ -3,6 +3,7 @@
  * model loaded between messages, and bridges tool calls to the agent tools.
  */
 
+import fs from 'node:fs'
 import { Worker } from 'node:worker_threads'
 import type { ToolCall, ToolDef, Message } from '../renderer/lib/providers'
 import type { AgentEvent } from './agent/loop'
@@ -16,6 +17,8 @@ export type GgufChatOptions = {
   modelPath: string
   messages: Pick<Message, 'role' | 'content'>[]
   tools?: ToolDef[]
+  /** Let reasoning models think before answering (slower). */
+  thinking?: boolean
   temperature: number
   maxTokens: number
   signal: AbortSignal
@@ -31,10 +34,17 @@ export class GgufEngine {
   private idleTimer: NodeJS.Timeout | null = null
   private nextId = 0
 
-  constructor(private readonly workerPath: string) {}
+  constructor(private readonly workerPath: string, private readonly logPath?: string) {}
+
+  private writeLog(text: string) {
+    if (!this.logPath) return
+    try { fs.appendFileSync(this.logPath, `[${new Date().toISOString()}] ${text}
+`) } catch { /* logging must never break chat */ }
+  }
 
   private start(modelPath: string): Entry {
     const worker = new Worker(this.workerPath)
+    worker.on('message', (msg: { type: string; text?: string }) => { if (msg.type === 'log' && msg.text) this.writeLog(msg.text) })
     const ready = new Promise<{ contextSize: number; gpu: string }>((resolve, reject) => {
       const onMessage = (msg: { type: string; error?: string; contextSize?: number; gpu?: string; id?: string }) => {
         if (msg.type === 'loaded') { worker.off('message', onMessage); resolve({ contextSize: msg.contextSize ?? 0, gpu: msg.gpu ?? 'cpu' }) }
@@ -91,8 +101,10 @@ export class GgufEngine {
     const onMessage = (msg: { type: string; id?: string; content?: string; error?: string; callId?: string; name?: string; args?: Record<string, unknown> }) => {
       if (msg.id !== id) return
       if (msg.type === 'text' && msg.content) push({ type: 'text', content: msg.content })
+      else if (msg.type === 'thought' && msg.content) push({ type: 'thought', content: msg.content })
       else if (msg.type === 'done') push({ type: 'text', content: '' }, true)
-      else if (msg.type === 'error') push({ type: 'error', error: msg.error ?? 'Ошибка модели' }, true)
+      else if (msg.type === 'error') push({ type: 'error', error: `${msg.error ?? 'Ошибка модели'}${this.logPath ? `
+(подробности в журнале: ${this.logPath})` : ''}` }, true)
       else if (msg.type === 'tool_request' && msg.callId && msg.name) void this.handleTool(entry.worker, msg.callId, msg.name, msg.args ?? {}, opts, push)
     }
     const onExit = () => push({ type: 'error', error: 'Процесс llama.cpp неожиданно завершился (возможно, не хватило памяти)' }, true)
@@ -103,13 +115,13 @@ export class GgufEngine {
 
     entry.worker.postMessage({
       type: 'chat', id,
-      messages: opts.messages, tools: opts.tools ?? [], temperature: opts.temperature, maxTokens: opts.maxTokens,
+      messages: opts.messages, tools: opts.tools ?? [], temperature: opts.temperature, maxTokens: opts.maxTokens, thinking: opts.thinking === true,
     })
 
     try {
       while (true) {
         const event = queue.shift()
-        if (event) { if (event.type !== 'text' || event.content) yield event; continue }
+        if (event) { if ((event.type !== 'text' && event.type !== 'thought') || event.content) yield event; continue }
         if (finished) return
         await new Promise<void>((resolve) => { wake = resolve })
       }

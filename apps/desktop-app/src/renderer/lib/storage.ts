@@ -43,6 +43,7 @@ export type StoredMessage = {
   content: string
   createdAt: number
   steps?: ToolStep[]
+  thinking?: string
 }
 
 export async function getSessions(): Promise<StoredSession[]> {

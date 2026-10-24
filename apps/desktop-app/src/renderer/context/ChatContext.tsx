@@ -18,6 +18,7 @@ type ChatContext = {
   sessions: StoredSession[]
   addMessage: (msg: ChatMessage, sessionId?: string) => void
   persistMessage: (id: string) => void
+  appendThought: (id: string, chunk: string) => void
   addStep: (messageId: string, step: ToolStep) => void
   finishStep: (messageId: string, stepId: string, output: string, isError: boolean) => void
   setMessages: (msgs: ChatMessage[]) => void
@@ -38,11 +39,11 @@ export function useChat() {
 }
 
 function toStored(m: ChatMessage, sessionId: string): StoredMessage {
-  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}) }
+  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}), ...(m.thinking ? { thinking: m.thinking } : {}) }
 }
 
 function toChat(m: StoredMessage): ChatMessage {
-  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}) }
+  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}), ...(m.thinking ? { thinking: m.thinking } : {}) }
 }
 
 export function ChatProvider({ children }: { children: React.ReactNode }) {
@@ -92,6 +93,10 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
     )
   }, [])
 
+  const appendThought = useCallback((id: string, chunk: string) => {
+    setMessages((prev) => prev.map((m: ChatMessage) => (m.id === id ? { ...m, thinking: (m.thinking ?? '') + chunk } : m)))
+  }, [])
+
   const addStep = useCallback((messageId: string, step: ToolStep) => {
     setMessages((prev) => prev.map((m: ChatMessage) => (m.id === messageId ? { ...m, steps: [...(m.steps ?? []), step] } : m)))
   }, [])
@@ -136,7 +141,7 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
   }, [currentSessionId, sessions])
 
   return (
-    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, persistMessage, addStep, finishStep, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
+    <ChatContext.Provider value={{ messages, currentSessionId, sessions, addMessage, persistMessage, appendThought, addStep, finishStep, setMessages, appendStream, createSession, switchSession, deleteSession, isLoading, setIsLoading }}>
       {children}
     </ChatContext.Provider>
   )

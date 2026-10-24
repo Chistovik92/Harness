@@ -12,11 +12,11 @@ import { PermissionDialog, ToolSteps } from '@/components/AgentUi'
 import { ModelProfileCard } from '@/components/ModelBadges'
 import { useUpdate } from '@/context/UpdateContext'
 
-type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number; steps?: ToolStep[] }
+type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number; steps?: ToolStep[]; thinking?: string }
 
 export default function App() {
   const { settings, saveSettings, isConnected, setIsConnected } = useDsh()
-  const { messages, addMessage, persistMessage, addStep, finishStep, appendStream, isLoading, setIsLoading, currentSessionId, createSession, sessions, switchSession, deleteSession, setMessages } = useChat()
+  const { messages, addMessage, persistMessage, appendThought, addStep, finishStep, appendStream, isLoading, setIsLoading, currentSessionId, createSession, sessions, switchSession, deleteSession, setMessages } = useChat()
 
   const [providers, setProviders] = useState<any[]>([])
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null)
@@ -30,6 +30,13 @@ export default function App() {
   const [agentMode, setAgentMode] = useState<boolean>(() => {
     try { return localStorage.getItem('dsh-agent-mode') === '1' } catch { return false }
   })
+  const [thinkingMode, setThinkingMode] = useState<boolean>(() => {
+    try { return localStorage.getItem('dsh-thinking') === '1' } catch { return false }
+  })
+  const toggleThinking = (on: boolean) => {
+    setThinkingMode(on)
+    try { localStorage.setItem('dsh-thinking', on ? '1' : '0') } catch { /* storage unavailable */ }
+  }
   const toggleAgent = (on: boolean) => {
     setAgentMode(on)
     try { localStorage.setItem('dsh-agent-mode', on ? '1' : '0') } catch { /* storage unavailable */ }
@@ -84,6 +91,7 @@ export default function App() {
       const id = streamIdRef.current
       if (!id || chunk.streamId !== id) return
       if (chunk.type === 'text' && chunk.content) appendStream(id, chunk.content)
+      else if (chunk.type === 'thought' && chunk.content) appendThought(id, chunk.content)
       else if (chunk.type === 'tool_start' && chunk.toolCall) {
         addStep(id, { id: chunk.toolCall.id, name: chunk.toolCall.name, summary: chunk.summary ?? chunk.toolCall.name, arguments: chunk.toolCall.arguments, status: 'running' })
       } else if (chunk.type === 'tool_result' && chunk.toolCallId) {
@@ -126,6 +134,7 @@ export default function App() {
         maxTokens: settings.maxTokens ?? 4096,
         signalId: assistantId,
         agent: agentMode,
+        thinking: thinkingMode,
       })
       abortRef.current = stream.cancel
       await stream.done
@@ -270,6 +279,10 @@ export default function App() {
               <ShieldCheck className="w-4 h-4 text-indigo-300" /> Режим агента
             </label>
             <div className="text-xs text-slate-500">Файлы, поиск, команды, веб и SSH. Работает с моделями API и GGUF.</div>
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer" title="Модели с рассуждениями (Qwen3 и др.) сначала думают, потом отвечают: точнее, но медленнее. Только для локальных GGUF-моделей.">
+              <input type="checkbox" checked={thinkingMode} onChange={(e) => toggleThinking(e.target.checked)} className="w-3.5 h-3.5 rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-indigo-500" />
+              Размышления модели (медленнее)
+            </label>
             {agentMode && (
               <>
                 <button onClick={pickWorkspace} className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 text-xs text-slate-300 text-left" title={settings.workspace ?? ''}>
@@ -315,15 +328,21 @@ export default function App() {
         </aside>
 
         <main className="flex-1 flex flex-col min-w-0 bg-slate-900 relative">
-          <div className="flex-1 overflow-y-auto p-6 scrollbar-thin" id="chat-scroll">
+          <div className="flex-1 overflow-y-auto overflow-x-hidden p-6 scrollbar-thin" id="chat-scroll">
             <div className="max-w-3xl mx-auto space-y-6">
               {messages.map((m: ChatMessage) => (
                 <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[85%] p-3 rounded-2xl ${m.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-slate-800 text-slate-200 rounded-tl-none border border-slate-800'} ${m.role === 'assistant' && streamId === m.id ? 'animate-pulse' : ''}`}>
+                  <div className={`max-w-[85%] min-w-0 p-3 rounded-2xl ${m.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-slate-800 text-slate-200 rounded-tl-none border border-slate-800'} ${m.role === 'assistant' && streamId === m.id ? 'animate-pulse' : ''}`}>
                     <div className="flex items-baseline gap-2 mb-1">
                       <span className={m.role === 'user' ? 'text-indigo-200 text-xs font-medium' : 'text-slate-400 text-xs font-medium'}>{m.role === 'user' ? 'Вы' : currentProvider?.name || 'Ассистент'}</span>
                       {m.role === 'assistant' && streamId && streamId === m.id && <span className="text-xs text-slate-500 animate-pulse">пишет…</span>}
                     </div>
+                    {m.thinking && (
+                      <details className="mb-2 rounded-lg border border-slate-700 bg-slate-950/60 text-xs" open={streamId === m.id && !m.content}>
+                        <summary className="cursor-pointer px-3 py-1.5 text-slate-400">Размышления модели</summary>
+                        <pre className="px-3 pb-3 whitespace-pre-wrap break-words text-slate-400 max-h-64 overflow-auto">{m.thinking}</pre>
+                      </details>
+                    )}
                     <ToolSteps steps={m.steps} />
                     <div dangerouslySetInnerHTML={{ __html: renderMarkdown(m.content) }} className="prose prose-sm prose-invert max-w-none" />
                   </div>

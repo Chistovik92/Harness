@@ -58,12 +58,14 @@ export type ChatMessage = {
   content: string
   createdAt: number
   steps?: ToolStep[]
+  /** The model's reasoning, shown in a collapsible block. */
+  thinking?: string
 }
 
 export type ToolCallInfo = { id: string; name: string; arguments: Record<string, unknown> }
 
 export type ChatChunk = {
-  type: 'text' | 'done' | 'error' | 'tool_start' | 'tool_result'
+  type: 'text' | 'thought' | 'done' | 'error' | 'tool_start' | 'tool_result'
   content?: string
   error?: string
   streamId?: string
@@ -106,6 +108,7 @@ export type StreamOptions = {
   maxTokens?: number
   signalId: string
   agent?: boolean
+  thinking?: boolean
 }
 
 type DshApi = {

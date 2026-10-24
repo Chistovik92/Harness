@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { encrypt, decrypt, generateKey, isValidKey } from '../electron/secureStore'
 import { isValidModelId } from '../electron/localHf'
+import { createThinkRouter } from '../electron/thinkRouter'
 import { readSSE } from '../renderer/lib/sse'
 import { OpenAICompatibleProvider } from '../renderer/lib/openaiProvider'
 import { GoogleProvider } from '../renderer/lib/googleProvider'
@@ -155,5 +156,30 @@ describe('isValidModelId', () => {
     expect(isValidModelId('org/..')).toBe(false)
     expect(isValidModelId('a/b/c')).toBe(false)
     expect(isValidModelId(42)).toBe(false)
+  })
+})
+
+describe('createThinkRouter', () => {
+  const run = (chunks: string[]) => {
+    const text: string[] = []
+    const thought: string[] = []
+    const router = createThinkRouter((t) => text.push(t), (t) => thought.push(t))
+    for (const c of chunks) router.push(c)
+    router.flush()
+    return { text: text.join(''), thought: thought.join('') }
+  }
+
+  it('passes plain answers through untouched', () => {
+    expect(run(['Hello', ' world'])).toEqual({ text: 'Hello world', thought: '' })
+  })
+
+  it('moves a leading think block to thoughts, even when tags are split across chunks', () => {
+    expect(run(['<th', 'ink>I should ', 'add numbers</th', 'ink>51'])).toEqual({ text: '51', thought: 'I should add numbers' })
+    expect(run(['\n<think>\n\n</think>\n\nAnswer'])).toEqual({ text: '\n\nAnswer', thought: '' })
+  })
+
+  it('does not swallow text that merely starts like a tag, and flushes unfinished thoughts', () => {
+    expect(run(['<th', 'at is odd'])).toEqual({ text: '<that is odd', thought: '' })
+    expect(run(['<think>unfinished reasoning'])).toEqual({ text: '', thought: 'unfinished reasoning' })
   })
 })

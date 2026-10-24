@@ -18,6 +18,7 @@ export const toolDefs = (): ToolDef[] => ALL_TOOLS.map((t) => t.def)
 
 export type AgentEvent =
   | { type: 'text'; content: string }
+  | { type: 'thought'; content: string }
   | { type: 'tool_start'; toolCall: ToolCall; summary: string }
   | { type: 'tool_result'; toolCallId: string; name: string; output: string; isError: boolean }
   | { type: 'error'; error: string }

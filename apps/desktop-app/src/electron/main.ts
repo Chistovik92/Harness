@@ -296,7 +296,7 @@ const hfAuth = new HfAuth(
   new EncryptedStore<StoredAuth>(path.join(USER_DATA, 'hf-auth.enc.json'), storageKey, () => null),
   (url) => shell.openExternal(url),
 )
-const ggufEngine = new GgufEngine(path.join(__dirname, 'gguf-worker.js'))
+const ggufEngine = new GgufEngine(path.join(__dirname, 'gguf-worker.js'), path.join(USER_DATA, 'gguf.log'))
 const modelIpc = registerModelIpc({ ggufDir: GGUF_DIR, onnxCache: HF_CACHE, workerPath: path.join(__dirname, 'hf-worker.js'), auth: hfAuth })
 const agentIpc = registerAgentIpc(new EncryptedStore<SshConnection[]>(path.join(USER_DATA, 'connections.enc.json'), storageKey, () => []))
 
@@ -438,7 +438,7 @@ ipcMain.handle('window:minimize', () => mainWindow?.minimize())
 const MAX_MESSAGES = 500
 const ROLES = new Set(['system', 'user', 'assistant'])
 
-type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string; agent: boolean }
+type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string; agent: boolean; thinking: boolean }
 
 function parseChatRequest(raw: any): ChatRequest {
   const providerId = str(raw?.providerId, 100)
@@ -453,11 +453,16 @@ function parseChatRequest(raw: any): ChatRequest {
     .map((m: any) => ({ role: m.role, content: m.content }))
   if (messages.length === 0) throw new Error('No non-empty messages to send')
   return {
-    providerId, model, messages, signalId, agent: raw.agent === true,
+    providerId, model, messages, signalId, agent: raw.agent === true, thinking: raw.thinking === true,
     temperature: clamp(raw.temperature, 0, 2, 0.7),
     maxTokens: Math.round(clamp(raw.maxTokens, 1, 131072, 4096)),
   }
 }
+
+/** Small local models drift into other languages (often Chinese) unless told not to. */
+const LOCAL_LANGUAGE_PROMPT = 'You are a helpful assistant. Always answer in the same language as the latest user message and do not mix languages.'
+const withLanguagePrompt = (messages: Message[]): Message[] =>
+  messages.some((m) => m.role === 'system') ? messages : [{ role: 'system', content: LOCAL_LANGUAGE_PROMPT }, ...messages]
 
 ipcMain.handle('chat:stream', async (event, raw) => {
   const req = parseChatRequest(raw)
@@ -480,7 +485,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
     if (!sender.isDestroyed()) sender.send('chat:chunk', { streamId: req.signalId, ...chunk })
   }
   const sendEvent = (e: AgentEvent) => {
-    if (e.type === 'text') { if (e.content) send({ type: 'text', content: e.content }) } else send(e)
+    if (e.type === 'text' || e.type === 'thought') { if (e.content) send({ type: e.type, content: e.content }) } else send(e)
   }
 
   try {
@@ -496,7 +501,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
         if (ggufPath) {
           const messages = [{ role: 'system' as const, content: buildSystemPrompt(workspace) }, ...req.messages]
           for await (const e of ggufEngine.chat({
-            modelPath: ggufPath, messages, tools: toolDefs(), temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal,
+            modelPath: ggufPath, messages, tools: toolDefs(), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal,
             runTool: (call) => executeTool(call.name, call.arguments, ctx), summarize: summarizeCall,
           })) { sendEvent(e); if (e.type === 'error') break }
         } else {
@@ -506,7 +511,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
         ctx.remote.closeAll()
       }
     } else if (ggufPath) {
-      for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal })) {
+      for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: withLanguagePrompt(req.messages), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal })) {
         sendEvent(e)
         if (e.type === 'error') break
       }
@@ -514,7 +519,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
       const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
         ? runLocalModel({
             workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
-            messages: req.messages, temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
+            messages: withLanguagePrompt(req.messages), temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
             signal: controller.signal,
           })
         : provider.chat({ model: req.model, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, config: providerConfig })
