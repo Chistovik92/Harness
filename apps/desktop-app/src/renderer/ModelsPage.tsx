@@ -151,7 +151,13 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
   }
 
   const downloaded = new Set(local.map((m) => m.id))
-  const recommended = (list: GgufFile[]) => RECOMMENDED_QUANTS.map((q) => list.find((f) => f.quant === q)).find(Boolean)
+  // Prefer plain builds over MTP ones (extra speculative-decoding layers) and never recommend helper files.
+  const recommended = (list: GgufFile[]) => {
+    const main = list.filter((f) => f.role === 'main')
+    const plain = main.filter((f) => /nomtp/i.test(f.file))
+    const pool = plain.length > 0 ? plain : main
+    return RECOMMENDED_QUANTS.map((q) => pool.find((f) => f.quant === q)).find(Boolean)
+  }
 
   function ProgressBar({ id }: { id: string }) {
     const progress = progressOf(id)
@@ -302,10 +308,14 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
     if (!list || list === 'loading') return <div className="text-xs text-slate-500">Загрузка списка файлов…</div>
     if (list.length === 0) return <div className="text-xs text-slate-500">В репозитории нет GGUF-файлов</div>
     const best = recommended(list)
+    const ordered = [...list.filter((f) => f.role === 'main'), ...list.filter((f) => f.role === 'draft')]
     return (
       <div className="space-y-2">
         <div className="text-xs text-slate-500">Чем больше число в Q, тем выше качество и размер. Q4_K_M — хороший баланс.</div>
-        {list.map((f) => {
+        {list.some((f) => /nomtp/i.test(f.file)) && (
+          <div className="text-xs text-slate-500">Файлы «noMTP» — без дополнительных слоёв спекулятивного декодирования, они надёжнее запускаются.</div>
+        )}
+        {ordered.map((f) => {
           const id = ggufModelId(repo, f.file)
           const isDone = downloaded.has(id)
           const inProgress = Boolean(downloading[id])
@@ -314,9 +324,10 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
               <div className="flex items-center gap-3">
                 <div className="flex-1 min-w-0">
                   <div className="text-xs text-slate-200 truncate">{f.file}{f.parts.length > 1 ? ` (${f.parts.length} частей)` : ''}</div>
-                  <div className="text-xs text-slate-500">{f.quant} · {formatBytes(f.size)}{best === f ? ' · рекомендуется' : ''}</div>
+                  <div className="text-xs text-slate-500">{f.quant} · {formatBytes(f.size)}{best === f ? ' · рекомендуется' : ''}{f.role === 'draft' ? ' · draft' : ''}</div>
                 </div>
-                {isDone ? <span className="text-xs text-emerald-300">Скачано</span>
+                {f.role === 'draft' ? <span className="text-xs text-amber-300 max-w-[14rem] text-right">Вспомогательная (draft) модель: отдельно не работает</span>
+                  : isDone ? <span className="text-xs text-emerald-300">Скачано</span>
                   : inProgress ? <button onClick={() => window.__DSH__.hf.cancelDownload(id)} aria-label="Отменить" className="p-1 text-slate-400 hover:text-red-400"><X className="w-4 h-4" /></button>
                   : <button onClick={() => downloadGguf(repo, f)} className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs"><Download className="w-3.5 h-3.5" /> Скачать</button>}
               </div>

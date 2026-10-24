@@ -162,6 +162,17 @@ describe('GGUF hub client', () => {
     await expect(listGgufFiles('../evil')).rejects.toThrow()
   })
 
+  it('marks speculative-decoding draft files so they are not offered as chat models', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify([
+      { type: 'file', path: 'M-27B-Q4_K_M.gguf', lfs: { size: 16000 } },
+      { type: 'file', path: 'M-27B-noMTP-Q4_K_M.gguf', lfs: { size: 15000 } },
+      { type: 'file', path: 'M-27B-draft-Q8_0.gguf', lfs: { size: 3000 } },
+      { type: 'file', path: 'drafty/M-Q4_0.gguf', lfs: { size: 100 } },
+    ]))))
+    const roles = Object.fromEntries((await listGgufFiles('org/repo')).map((f) => [f.file, f.role]))
+    expect(roles).toEqual({ 'M-27B-Q4_K_M.gguf': 'main', 'M-27B-noMTP-Q4_K_M.gguf': 'main', 'M-27B-draft-Q8_0.gguf': 'draft', 'drafty/M-Q4_0.gguf': 'main' })
+  })
+
   it('resumes an interrupted download with a Range request and finishes atomically', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dl-'))
     try {

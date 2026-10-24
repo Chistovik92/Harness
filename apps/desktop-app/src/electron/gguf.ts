@@ -1,10 +1,12 @@
 /**
- * Main-process side of the GGUF engine: owns the llama.cpp worker, keeps the
- * model loaded between messages, and bridges tool calls to the agent tools.
+ * Main-process side of the GGUF engine. llama.cpp runs in a separate child
+ * process: a native crash (out of memory, GPU driver fault) then kills only
+ * that process and the app survives. The model stays loaded between messages,
+ * and tool calls are bridged to the agent tools.
  */
 
 import fs from 'node:fs'
-import { Worker } from 'node:worker_threads'
+import { fork, type ChildProcess } from 'node:child_process'
 import type { ToolCall, ToolDef, Message } from '../renderer/lib/providers'
 import type { AgentEvent } from './agent/loop'
 import type { ToolResult } from './agent/types'
@@ -12,6 +14,7 @@ import type { ToolResult } from './agent/types'
 const IDLE_UNLOAD_MS = 10 * 60 * 1000
 /** Tool output fed back into a small local context window. */
 const LOCAL_TOOL_OUTPUT_LIMIT = 6000
+const STDERR_TAIL_CHARS = 3000
 
 export type GgufChatOptions = {
   modelPath: string
@@ -27,8 +30,40 @@ export type GgufChatOptions = {
   summarize?: (call: ToolCall) => string
 }
 
-type Entry = { modelPath: string; worker: Worker; ready: Promise<{ contextSize: number; gpu: string }> }
+type WorkerMessage = {
+  type: string
+  id?: string
+  error?: string
+  text?: string
+  content?: string
+  contextSize?: number
+  gpu?: string
+  callId?: string
+  name?: string
+  args?: Record<string, unknown>
+}
 
+type Entry = {
+  modelPath: string
+  child: ChildProcess
+  ready: Promise<{ contextSize: number; gpu: string }>
+  /** Last stderr output, kept to explain an unexpected exit. */
+  stderr: { text: string }
+}
+
+const describeExit = (code: number | null, signal: NodeJS.Signals | null) =>
+  signal ? `сигнал ${signal}` : `код ${code ?? 'неизвестен'}`
+
+/** 0xC0000005 (access violation) / SIGSEGV: llama.cpp hit missing or invalid data, not a shortage of memory. */
+const isMemoryFault = (code: number | null, signal: NodeJS.Signals | null) =>
+  code === 3221225477 || code === -1073741819 || code === 139 || signal === 'SIGSEGV'
+
+function explainCrash(code: number | null, signal: NodeJS.Signals | null, stage: string): string {
+  const what = `Процесс llama.cpp аварийно завершился ${stage} (${describeExit(code, signal)}). Приложение продолжает работать.`
+  return isMemoryFault(code, signal)
+    ? `${what} Это сбой доступа к памяти внутри llama.cpp: файл модели повреждён, скачан не полностью, это вспомогательная (draft/MTP) часть модели или архитектура не поддерживается встроенной версией llama.cpp. Скачайте другой файл (или квантизацию) из репозитория.`
+    : `${what} Вероятнее всего модели не хватило памяти (ОЗУ или видеопамяти): выберите модель меньшего размера или квантизацию Q4 и закройте другие программы.`
+}
 export class GgufEngine {
   private entry: Entry | null = null
   private idleTimer: NodeJS.Timeout | null = null
@@ -38,49 +73,61 @@ export class GgufEngine {
 
   private writeLog(text: string) {
     if (!this.logPath) return
-    try { fs.appendFileSync(this.logPath, `[${new Date().toISOString()}] ${text}
-`) } catch { /* logging must never break chat */ }
+    try { fs.appendFileSync(this.logPath, `[${new Date().toISOString()}] ${text}\n`) } catch { /* logging must never break chat */ }
   }
 
   private start(modelPath: string): Entry {
-    const worker = new Worker(this.workerPath)
-    worker.on('message', (msg: { type: string; text?: string }) => { if (msg.type === 'log' && msg.text) this.writeLog(msg.text) })
-    const ready = new Promise<{ contextSize: number; gpu: string }>((resolve, reject) => {
-      const onMessage = (msg: { type: string; error?: string; contextSize?: number; gpu?: string; id?: string }) => {
-        if (msg.type === 'loaded') { worker.off('message', onMessage); resolve({ contextSize: msg.contextSize ?? 0, gpu: msg.gpu ?? 'cpu' }) }
-        else if (msg.type === 'error' && msg.id === undefined) { worker.off('message', onMessage); reject(new Error(msg.error ?? 'Не удалось загрузить модель')) }
-      }
-      worker.on('message', onMessage)
-      worker.once('error', reject)
-      worker.once('exit', () => reject(new Error('Процесс llama.cpp завершился при загрузке модели')))
+    // ELECTRON_RUN_AS_NODE makes the Electron binary behave as plain Node for this child.
+    const child = fork(this.workerPath, [], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      execArgv: [],
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
     })
-    ready.catch(() => this.unload(worker))
-    worker.once('exit', () => { if (this.entry?.worker === worker) this.entry = null })
-    worker.postMessage({ type: 'load', modelPath })
-    return { modelPath, worker, ready }
+    const stderr = { text: '' }
+    child.stderr?.on('data', (chunk: Buffer) => { stderr.text = (stderr.text + chunk.toString('utf8')).slice(-STDERR_TAIL_CHARS) })
+    child.on('message', (msg: WorkerMessage) => { if (msg.type === 'log' && msg.text) this.writeLog(msg.text) })
+
+    const ready = new Promise<{ contextSize: number; gpu: string }>((resolve, reject) => {
+      const onMessage = (msg: WorkerMessage) => {
+        if (msg.type === 'loaded') { child.off('message', onMessage); resolve({ contextSize: msg.contextSize ?? 0, gpu: msg.gpu ?? 'cpu' }) }
+        else if (msg.type === 'error' && msg.id === undefined) { child.off('message', onMessage); reject(new Error(msg.error ?? 'Не удалось загрузить модель')) }
+      }
+      child.on('message', onMessage)
+      child.once('error', reject)
+      child.once('exit', (code, signal) => {
+        this.writeLog(`load: process exited (${describeExit(code, signal)}) stderr: ${stderr.text}`)
+        reject(new Error(explainCrash(code, signal, 'при загрузке модели')))
+      })
+    })
+    ready.catch(() => this.unload(child))
+    child.once('exit', () => { if (this.entry?.child === child) this.entry = null })
+    child.send({ type: 'load', modelPath })
+    return { modelPath, child, ready, stderr }
   }
 
-  private unload(worker: Worker) {
-    void worker.terminate()
-    if (this.entry?.worker === worker) this.entry = null
+  private unload(child: ChildProcess) {
+    try { child.kill() } catch { /* already gone */ }
+    if (this.entry?.child === child) this.entry = null
   }
 
   private acquire(modelPath: string): Entry {
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null }
-    if (this.entry && this.entry.modelPath !== modelPath) { this.unload(this.entry.worker) }
+    if (this.entry && (this.entry.modelPath !== modelPath || this.entry.child.exitCode !== null || !this.entry.child.connected)) {
+      this.unload(this.entry.child)
+    }
     this.entry ??= this.start(modelPath)
     return this.entry
   }
 
   private scheduleUnload() {
     if (this.idleTimer) clearTimeout(this.idleTimer)
-    this.idleTimer = setTimeout(() => { if (this.entry) this.unload(this.entry.worker) }, IDLE_UNLOAD_MS)
+    this.idleTimer = setTimeout(() => { if (this.entry) this.unload(this.entry.child) }, IDLE_UNLOAD_MS)
     this.idleTimer.unref?.()
   }
 
   dispose() {
     if (this.idleTimer) clearTimeout(this.idleTimer)
-    if (this.entry) this.unload(this.entry.worker)
+    if (this.entry) this.unload(this.entry.child)
   }
 
   async *chat(opts: GgufChatOptions): AsyncGenerator<AgentEvent> {
@@ -88,7 +135,7 @@ export class GgufEngine {
     try {
       await entry.ready
     } catch (err) {
-      yield { type: 'error', error: err instanceof Error ? err.message : String(err) }
+      yield { type: 'error', error: this.withLogHint(err instanceof Error ? err.message : String(err)) }
       return
     }
 
@@ -98,22 +145,24 @@ export class GgufEngine {
     let wake: (() => void) | null = null
     const push = (event: AgentEvent, last = false) => { queue.push(event); if (last) finished = true; wake?.(); wake = null }
 
-    const onMessage = (msg: { type: string; id?: string; content?: string; error?: string; callId?: string; name?: string; args?: Record<string, unknown> }) => {
+    const onMessage = (msg: WorkerMessage) => {
       if (msg.id !== id) return
       if (msg.type === 'text' && msg.content) push({ type: 'text', content: msg.content })
       else if (msg.type === 'thought' && msg.content) push({ type: 'thought', content: msg.content })
       else if (msg.type === 'done') push({ type: 'text', content: '' }, true)
-      else if (msg.type === 'error') push({ type: 'error', error: `${msg.error ?? 'Ошибка модели'}${this.logPath ? `
-(подробности в журнале: ${this.logPath})` : ''}` }, true)
-      else if (msg.type === 'tool_request' && msg.callId && msg.name) void this.handleTool(entry.worker, msg.callId, msg.name, msg.args ?? {}, opts, push)
+      else if (msg.type === 'error') push({ type: 'error', error: this.withLogHint(msg.error ?? 'Ошибка модели') }, true)
+      else if (msg.type === 'tool_request' && msg.callId && msg.name) void this.handleTool(entry.child, msg.callId, msg.name, msg.args ?? {}, opts, push)
     }
-    const onExit = () => push({ type: 'error', error: 'Процесс llama.cpp неожиданно завершился (возможно, не хватило памяти)' }, true)
-    entry.worker.on('message', onMessage)
-    entry.worker.once('exit', onExit)
-    const onAbort = () => entry.worker.postMessage({ type: 'abort', id })
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      this.writeLog(`chat: process exited (${describeExit(code, signal)}) stderr: ${entry.stderr.text}`)
+      push({ type: 'error', error: this.withLogHint(explainCrash(code, signal, 'во время ответа')) }, true)
+    }
+    entry.child.on('message', onMessage)
+    entry.child.once('exit', onExit)
+    const onAbort = () => this.send(entry.child, { type: 'abort', id })
     opts.signal.addEventListener('abort', onAbort, { once: true })
 
-    entry.worker.postMessage({
+    this.send(entry.child, {
       type: 'chat', id,
       messages: opts.messages, tools: opts.tools ?? [], temperature: opts.temperature, maxTokens: opts.maxTokens, thinking: opts.thinking === true,
     })
@@ -127,20 +176,28 @@ export class GgufEngine {
       }
     } finally {
       opts.signal.removeEventListener('abort', onAbort)
-      entry.worker.off('message', onMessage)
-      entry.worker.off('exit', onExit)
+      entry.child.off('message', onMessage)
+      entry.child.off('exit', onExit)
       this.scheduleUnload()
     }
   }
 
+  private withLogHint(message: string): string {
+    return this.logPath ? `${message}\n(подробности в журнале: ${this.logPath})` : message
+  }
+
+  private send(child: ChildProcess, message: Record<string, unknown>) {
+    try { if (child.connected) child.send(message) } catch (err) { this.writeLog(`send failed: ${String(err)}`) }
+  }
+
   private async handleTool(
-    worker: Worker, callId: string, name: string, args: Record<string, unknown>,
+    child: ChildProcess, callId: string, name: string, args: Record<string, unknown>,
     opts: GgufChatOptions, push: (event: AgentEvent) => void,
   ): Promise<void> {
     const call: ToolCall = { id: callId, name, arguments: args }
     push({ type: 'tool_start', toolCall: call, summary: opts.summarize?.(call) ?? name })
     const result: ToolResult = opts.runTool ? await opts.runTool(call) : { output: 'Инструменты недоступны', isError: true }
     push({ type: 'tool_result', toolCallId: callId, name, output: result.output.slice(0, 4000), isError: result.isError })
-    worker.postMessage({ type: 'tool_result', callId, output: result.output.slice(0, LOCAL_TOOL_OUTPUT_LIMIT) })
+    this.send(child, { type: 'tool_result', callId, output: result.output.slice(0, LOCAL_TOOL_OUTPUT_LIMIT) })
   }
 }

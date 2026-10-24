@@ -95,7 +95,7 @@ export type SshConnectionInput = Omit<SshConnectionInfo, 'hasPassword' | 'hasPas
 
 export type HfUser = { name: string; fullName?: string; avatar?: string }
 export type AuthStatus = { loggedIn: boolean; user?: HfUser }
-export type GgufFile = { file: string; size: number; quant: string; parts: string[] }
+export type GgufFile = { file: string; size: number; quant: string; parts: string[]; role: 'main' | 'draft' }
 
 export type LocalModel = { id: string; name: string; format: 'onnx' | 'gguf'; downloaded: boolean; sizeBytes: number; profile: ModelProfile }
 export type HubModel = { id: string; downloads: number; likes: number; gated: boolean; profile: ModelProfile }

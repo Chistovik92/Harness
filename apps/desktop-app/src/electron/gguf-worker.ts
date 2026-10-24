@@ -1,10 +1,12 @@
 /**
- * llama.cpp worker (node-llama-cpp). Keeps one GGUF model loaded and serves
+ * llama.cpp child process (node-llama-cpp). Keeps one GGUF model loaded and serves
  * chat requests, optionally with function calling. Tool calls are executed by
  * the main process: the worker sends `tool_request` and waits for `tool_result`.
  */
 
-import { parentPort } from 'node:worker_threads'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { createThinkRouter } from './thinkRouter'
 
 interface ChatMessage { role: string; content: string }
@@ -35,7 +37,10 @@ const THINK_BUDGET_TOKENS = 2048
 /** Errors that mean "the model's own chat template could not be applied". */
 const TEMPLATE_ERROR = /unexpected token|syntaxerror|jinja|template|chat ?wrapper|is not defined|cannot read propert/i
 
-const post = (message: Record<string, unknown>) => parentPort?.postMessage(message)
+// Runs as a forked child process: a native crash here must not take the app down.
+const post = (message: Record<string, unknown>) => { try { process.send?.(message) } catch { /* parent is gone */ } }
+const GB = 1024 ** 3
+const formatGb = (bytes: number) => `${(bytes / GB).toFixed(1)} ГБ`
 const log = (text: string) => post({ type: 'log', text })
 
 let lib: any
@@ -58,22 +63,42 @@ const wrapperChain: (() => unknown)[] = [
 
 async function load(modelPath: string): Promise<void> {
   lib = await importEsm('node-llama-cpp')
+  const fileName = path.basename(modelPath)
+  if (/(^|[-_.])draft([-_.]|$)/i.test(fileName)) {
+    throw new Error(`Файл «${fileName}» — вспомогательная (draft) модель для спекулятивного декодирования, отдельно она не работает и роняет llama.cpp. Скачайте основной файл этого репозитория (без «draft» в имени; у моделей с MTP надёжнее вариант «noMTP»).`)
+  }
   llama = await lib.getLlama()
+
+  // Loading a model that does not fit makes the OS thrash or the GPU driver abort: refuse up front.
+  const weights = fs.statSync(modelPath).size
+  const vram = await Promise.resolve(llama.getVramState?.()).catch(() => null)
+  const freeRam = os.freemem()
+  const freeVram = Number(vram?.free) || 0
+  if (weights * 1.1 > freeRam + freeVram) {
+    throw new Error(`Модель (${formatGb(weights)}) не поместится в память: свободно ${formatGb(freeRam)} ОЗУ и ${formatGb(freeVram)} видеопамяти. Закройте другие программы или выберите модель меньше (меньше параметров или квантизация Q4 вместо Q8).`)
+  }
+
   model = await llama.loadModel({ modelPath })
   const train = Number(model.trainContextSize) || MAX_CONTEXT
-  // Large contexts need a lot of memory: back off until one fits.
-  let size = Math.min(train, MAX_CONTEXT)
-  while (true) {
-    try {
-      context = await model.createContext({ contextSize: size })
-      break
-    } catch (err) {
-      if (size <= MIN_CONTEXT) throw err
-      size = Math.max(MIN_CONTEXT, Math.floor(size / 2))
+  const maxContext = Math.min(train, MAX_CONTEXT)
+  // Let llama.cpp pick the largest context that fits the memory that is actually free.
+  try {
+    context = await model.createContext({ contextSize: { min: Math.min(MIN_CONTEXT, maxContext), max: maxContext } })
+  } catch (err) {
+    log(`auto context failed, backing off: ${err instanceof Error ? err.message : String(err)}`)
+    let size = maxContext
+    while (true) {
+      try {
+        context = await model.createContext({ contextSize: size })
+        break
+      } catch (inner) {
+        if (size <= MIN_CONTEXT) throw inner
+        size = Math.max(MIN_CONTEXT, Math.floor(size / 2))
+      }
     }
   }
   sequence = context.getSequence()
-  post({ type: 'loaded', contextSize: size, gpu: llama.gpu || 'cpu' })
+  post({ type: 'loaded', contextSize: Number(context.contextSize) || 0, gpu: llama.gpu || 'cpu' })
 }
 
 /** node-llama-cpp accepts a restricted JSON-schema dialect: keep structure, drop prose keys. */
@@ -192,7 +217,7 @@ async function chat(req: ChatRequest): Promise<void> {
   }
 }
 
-parentPort?.on('message', (msg: Incoming) => {
+process.on('message', (msg: Incoming) => {
   if (msg.type === 'load') {
     load(msg.modelPath).catch((err) => {
       log(`load failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`)
@@ -208,3 +233,6 @@ parentPort?.on('message', (msg: Incoming) => {
     aborts.get(msg.id)?.abort()
   }
 })
+
+// The app closed the channel (quit or crash): nothing left to serve.
+process.on('disconnect', () => process.exit(0))

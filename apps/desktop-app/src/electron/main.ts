@@ -559,8 +559,19 @@ function setupUpdater() {
 ipcMain.handle('update:install', () => { isQuitting = true; updater?.quitAndInstall() })
 
 // ---- lifecycle -------------------------------------------------------------
-process.on('uncaughtException', (err) => console.error('Uncaught exception:', err))
-process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err))
+// Crash trail: a bug report with app.log beats "it just closed".
+const APP_LOG = path.join(USER_DATA, 'app.log')
+function logLine(text: string) {
+  try { fs.appendFileSync(APP_LOG, `[${new Date().toISOString()}] ${text}
+`) } catch { /* logging must never break the app */ }
+}
+process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); logLine(`uncaughtException: ${err?.stack ?? err}`) })
+process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); logLine(`unhandledRejection: ${(err as Error)?.stack ?? err}`) })
+app.on('render-process-gone', (_event, contents, details) => {
+  logLine(`render-process-gone: ${details.reason} (exit ${details.exitCode})`)
+  if (details.reason !== 'clean-exit' && !isQuitting && !contents.isDestroyed()) contents.reload()
+})
+app.on('child-process-gone', (_event, details) => logLine(`child-process-gone: ${details.type} ${details.reason} (exit ${details.exitCode})`))
 
 if (!app.requestSingleInstanceLock()) {
   app.quit()

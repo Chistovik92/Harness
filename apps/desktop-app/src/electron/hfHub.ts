@@ -17,7 +17,16 @@ const SEARCH_TIMEOUT_MS = 15_000
 const PROGRESS_INTERVAL_MS = 150
 
 export type HubModel = { id: string; downloads: number; likes: number; gated: boolean; profile: ModelProfile }
-export type GgufFile = { file: string; size: number; quant: string; parts: string[] }
+export type GgufFile = {
+  file: string
+  size: number
+  quant: string
+  parts: string[]
+  /** `draft` files are auxiliary models for speculative decoding and cannot be chatted with. */
+  role: 'main' | 'draft'
+}
+
+export const isDraftFile = (file: string): boolean => /(^|[-_.])draft([-_.]|$)/i.test(file.split('/').pop() ?? file)
 export type Progress = { file: string; loaded: number; total: number }
 
 // org/name, where neither part may be "." or ".." (path traversal).
@@ -114,7 +123,7 @@ export async function listGgufFiles(repoId: string, token?: string | null): Prom
       existing.size += size
       existing.parts.push(f.path)
     } else {
-      groups.set(key, { file: f.path, size, quant: QUANT.exec(path.basename(f.path))?.[1]?.toUpperCase() ?? 'GGUF', parts: [f.path] })
+      groups.set(key, { file: f.path, size, quant: QUANT.exec(path.basename(f.path))?.[1]?.toUpperCase() ?? 'GGUF', parts: [f.path], role: isDraftFile(f.path) ? 'draft' : 'main' })
     }
   }
   // The first shard is the entry point loaded by llama.cpp.
