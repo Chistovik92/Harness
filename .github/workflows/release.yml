@@ -74,6 +74,17 @@ jobs:
         working-directory: apps/desktop-app
         run: npm run build
 
+      # onnxruntime-node ships binaries for every OS (>200 MB); keep only this runner's.
+      - name: Prune foreign ONNX runtime binaries
+        shell: bash
+        working-directory: apps/desktop-app
+        run: |
+          dir=node_modules/onnxruntime-node/bin/napi-v3
+          case "$RUNNER_OS" in Windows) keep=win32 ;; macOS) keep=darwin ;; *) keep=linux ;; esac
+          if [ -d "$dir" ]; then
+            for d in "$dir"/*/; do [ "$(basename "$d")" = "$keep" ] || rm -rf "$d"; done
+          fi
+
       - name: Package and publish
         working-directory: apps/desktop-app
         env:

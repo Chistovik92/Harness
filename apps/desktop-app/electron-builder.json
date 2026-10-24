@@ -32,11 +32,7 @@
     "entitlements": "resources/entitlements.mac.plist",
     "gatekeeperAssess": false,
     "hardenedRuntime": true,
-    "icon": "resources/icon.png",
-    "files": [
-      "!node_modules/onnxruntime-node/bin/napi-v3/win32/**",
-      "!node_modules/onnxruntime-node/bin/napi-v3/linux/**"
-    ]
+    "icon": "resources/icon.png"
   },
   "dmg": {
     "format": "ULFO",
@@ -55,10 +51,6 @@
     ]
   },
   "win": {
-    "files": [
-      "!node_modules/onnxruntime-node/bin/napi-v3/darwin/**",
-      "!node_modules/onnxruntime-node/bin/napi-v3/linux/**"
-    ],
     "target": [
       "nsis"
     ],
@@ -89,11 +81,7 @@
       "GenericName": "AI Assistant",
       "Comment": "Desktop AI assistant by DeepSeek",
       "MimeType": "text/plain;text/markdown;"
-    },
-    "files": [
-      "!node_modules/onnxruntime-node/bin/napi-v3/win32/**",
-      "!node_modules/onnxruntime-node/bin/napi-v3/darwin/**"
-    ]
+    }
   },
   "publish": [
     {
