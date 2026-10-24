@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-desktop-app",
   "productName": "DeepSeek Harness",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Desktop AI assistant — chat, plugins, local history, auto-updates (Windows / Linux / macOS)",
   "author": "DeepSeek AI",
   "license": "MIT",
@@ -29,6 +29,7 @@
     "electron-updater": "^6.3.9",
     "lucide-react": "^0.395.0",
     "marked": "^12.0.0",
+    "node-llama-cpp": "^3.22.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tailwind-merge": "^2.3.0"

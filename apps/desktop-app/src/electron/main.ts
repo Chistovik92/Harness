@@ -392,10 +392,8 @@ ipcMain.handle('providers:listModels', async (_e, providerId: string) => {
     apiKey: cfg?.apiKey, baseUrl: cfg?.baseUrl, defaultModel: cfg?.defaultModel, enabled: cfg?.enabled !== false,
   })
   if (provider.kind !== 'huggingface-local') return models
-  // Downloaded models first, then the built-in suggestions that are not on disk yet.
-  const downloaded = (await listDownloadedModels().catch(() => [])).map((m) => ({ id: m.id, name: m.id, provider: provider.id, kind: provider.kind, local: true, downloaded: true }))
-  const have = new Set(downloaded.map((m) => m.id))
-  return [...downloaded, ...models.filter((m) => !have.has(m.id))]
+  // Only models that are on disk can be chatted with; others are fetched on the models page.
+  return (await listDownloadedModels().catch(() => [])).map((m) => ({ id: m.id, name: m.id, provider: provider.id, kind: provider.kind, local: true, downloaded: true }))
 })
 
 ipcMain.handle('dialog:openFile', async () => {

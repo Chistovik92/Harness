@@ -49,10 +49,11 @@ export default function App() {
       ;(async () => {
         const ms = await window.__DSH__.providers.listModels(selectedProvider)
         setModels(ms)
-        setSelectedModel(ms.length > 0 ? ms[0].id : '')
+        // Keep the current choice when it is still available (e.g. after visiting the models page).
+        setSelectedModel((prev) => (ms.some((m) => m.id === prev) ? prev : ms.length > 0 ? ms[0].id : ''))
       })().catch((err) => console.error('Failed to load models:', err))
     }
-  }, [selectedProvider])
+  }, [selectedProvider, view])
 
   function finishStream(id: string) {
     persistMessage(id)
@@ -222,6 +223,9 @@ export default function App() {
                 </option>
               ))}
             </select>
+            {isLocalProvider && models.length === 0 && (
+              <div className="mt-2 px-1 text-xs text-amber-200">Нет скачанных моделей. Скачайте их в разделе «Локальные модели».</div>
+            )}
           </div>
 
           <div className="p-2">
