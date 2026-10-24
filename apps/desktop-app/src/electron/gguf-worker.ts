@@ -24,6 +24,7 @@ type ChatRequest = {
 }
 
 type Incoming =
+  | { type: 'probe' }
   | { type: 'load'; modelPath: string }
   | ChatRequest
   | { type: 'tool_result'; callId: string; output: string }
@@ -89,6 +90,26 @@ async function createContext(): Promise<any> {
       size = Math.max(MIN_CONTEXT, Math.floor(size / 2))
     }
   }
+}
+
+/** Hardware as llama.cpp sees it (free VRAM included), without loading any model. */
+async function probe(): Promise<void> {
+  lib = await importEsm('node-llama-cpp')
+  llama = await lib.getLlama()
+  const vram = await Promise.resolve(llama.getVramState?.()).catch(() => null)
+  const names: string[] = await Promise.resolve(llama.getGpuDeviceNames?.()).catch(() => [])
+  const cpus = os.cpus()
+  post({
+    type: 'system',
+    backend: llama.gpu || 'cpu',
+    gpuName: names[0] ?? null,
+    vramTotal: Number(vram?.total) || 0,
+    vramFree: Number(vram?.free) || 0,
+    totalRam: os.totalmem(),
+    freeRam: os.freemem(),
+    cpuCores: cpus.length,
+    cpuModel: cpus[0]?.model?.trim() ?? '',
+  })
 }
 
 async function load(modelPath: string): Promise<void> {
@@ -292,7 +313,9 @@ async function chat(req: ChatRequest): Promise<void> {
 }
 
 process.on('message', (msg: Incoming) => {
-  if (msg.type === 'load') {
+  if (msg.type === 'probe') {
+    probe().catch((err) => post({ type: 'error', error: err instanceof Error ? err.message : String(err) }))
+  } else if (msg.type === 'load') {
     load(msg.modelPath).catch((err) => {
       log(`load failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`)
       post({ type: 'error', error: err instanceof Error ? err.message : String(err) })

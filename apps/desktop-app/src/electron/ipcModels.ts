@@ -7,9 +7,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { runLocalModel, isValidModelId, type DownloadProgress } from './localHf'
-import { searchModels, listGgufFiles, downloadHubFile, fetchProfile, REPO_ID, isGgufPath } from './hfHub'
+import { searchModels, listGgufFiles, downloadHubFile, fetchProfile, REPO_ID, isGgufPath, type GgufFile } from './hfHub'
 import type { HfAuth } from './hfAuth'
 import { buildProfile, type ModelProfile } from '../renderer/lib/modelProfile'
+import { estimateFit, q4WeightsBytes, FIT_RANK, type Fit, type SystemInfo } from '../renderer/lib/modelFit'
 
 export type LocalModelEntry = {
   id: string
@@ -34,6 +35,7 @@ export function parseGgufId(id: string): { repo: string; file: string } | null {
 }
 
 type Deps = {
+  getSystem: () => Promise<SystemInfo>
   ggufDir: string
   onnxCache: string
   workerPath: string
@@ -61,8 +63,96 @@ async function readStoredProfile(dir: string): Promise<ModelProfile | null> {
   try { return JSON.parse(await fs.promises.readFile(path.join(dir, PROFILE_FILE), 'utf-8')) as ModelProfile } catch { return null }
 }
 
+export type Recommendation = {
+  repo: string
+  file: string
+  parts: string[]
+  size: number
+  quant: string
+  downloads: number
+  profile: ModelProfile
+  fit: Fit
+}
+
+const GB = 1024 ** 3
+const RECOMMEND_QUERIES = ['Qwen3 Instruct', 'Qwen2.5 Instruct', 'gemma-3 it', 'Llama-3.1 Instruct', 'Mistral Nemo Instruct', 'Qwen2.5 Coder Instruct']
+/** Best quality-per-size first: Q4_K_M is the usual sweet spot. */
+const QUANT_PREFERENCE = ['Q4_K_M', 'Q4_K_S', 'IQ4_XS', 'Q5_K_M', 'Q4_0', 'Q3_K_M', 'IQ3_M', 'Q5_K_S', 'Q6_K', 'Q8_0', 'Q3_K_S', 'Q2_K', 'IQ2_M']
+/** Below Q3 quality drops sharply; such builds are not recommended. */
+const MIN_QUALITY_QUANTS = new Set(['Q4_K_M', 'Q4_K_S', 'IQ4_XS', 'Q5_K_M', 'Q4_0', 'Q3_K_M', 'IQ3_M', 'Q5_K_S', 'Q6_K', 'Q8_0'])
+/** Community fine-tunes are not recommended by default; they stay reachable through search. */
+const FINE_TUNE_MARKER = /abliterat|uncensor|heretic|hivemind|erotic|nsfw|roleplay|[-_]rp[-_]|distill|merge|neo-imatrix|narrator/i
+/** Publishers of the original models or well-known quantisers, preferred over unknown uploaders. */
+const TRUSTED_PUBLISHER = /^(qwen|bartowski|unsloth|lmstudio-community|google|mistralai|meta-llama|microsoft|ggml-org|maziyarpanahi)\//i
+const RECOMMEND_CACHE_MS = 10 * 60 * 1000
+const MAX_CANDIDATES = 26
+const MAX_FAST = 5
+/** Below this lower-bound speed a model is too slow to chat with comfortably. */
+const USABLE_TPS = 4
+const MAX_STRONGER = 3
+
 export function registerModelIpc(deps: Deps) {
-  const { ggufDir, onnxCache, workerPath, auth } = deps
+  const { ggufDir, onnxCache, workerPath, auth, getSystem } = deps
+  let recommendCache: { at: number; key: string; value: Recommendation[] } | null = null
+
+  /** The file of a repository that runs best here; among equals the preferred quantisation. */
+  function pickFile(files: GgufFile[], system: SystemInfo, parameters: number): { file: GgufFile; fit: Fit } | null {
+    // Drop helper files (imatrix etc.): a real build of N parameters is at least ~0.2 bytes per parameter.
+    const main = files.filter((f) => f.role === 'main' && f.size >= parameters * 0.2 && MIN_QUALITY_QUANTS.has(f.quant))
+    const plain = main.filter((f) => /nomtp/i.test(f.file))
+    const pool = plain.length > 0 ? plain : main
+    const scored = pool.map((file) => ({ file, fit: estimateFit(file.size, system) })).filter((x) => x.fit.level !== 'no')
+    if (scored.length === 0) return null
+    const best = Math.max(...scored.map((x) => FIT_RANK[x.fit.level]))
+    const top = scored.filter((x) => FIT_RANK[x.fit.level] === best)
+    const order = (q: string) => { const i = QUANT_PREFERENCE.indexOf(q); return i < 0 ? QUANT_PREFERENCE.length : i }
+    return top.sort((a, b) => order(a.file.quant) - order(b.file.quant) || b.file.size - a.file.size)[0]
+  }
+
+  async function recommend(system: SystemInfo): Promise<Recommendation[]> {
+    const key = `${Math.round(system.vramFree / GB)}-${Math.round(system.freeRam / GB)}`
+    if (recommendCache && recommendCache.key === key && Date.now() - recommendCache.at < RECOMMEND_CACHE_MS) return recommendCache.value
+
+    const token = await auth.getToken()
+    const lists = await Promise.all(RECOMMEND_QUERIES.map((q) => searchModels('gguf', q, token).catch(() => [])))
+    // What the machine could hold at all: free video memory plus usable RAM.
+    const ceiling = (system.vramFree * 0.92) + (system.freeRam * 0.85)
+    const seenFamilies = new Set<string>()
+    const candidates = lists.flat()
+      .filter((m) => !FINE_TUNE_MARKER.test(m.id))
+      .filter((m) => m.profile.parameters && m.profile.parameters >= 1.5e9 && (m.profile.russian === 'good' || m.profile.russian === 'native'))
+      .filter((m) => q4WeightsBytes(m.profile.parameters!) * 1.08 + 0.7 * GB <= ceiling)
+      .sort((a, b) => b.downloads - a.downloads)
+      .filter((m) => {
+        // The same model is uploaded by many people: keep the most downloaded repository per family.
+        const family = (m.id.split('/')[1] ?? m.id).toLowerCase().replace(/-?gguf$/, '').replace(/^qwen_/, '').replace(/\.1-/, '-')
+        if (seenFamilies.has(family)) return false
+        seenFamilies.add(family)
+        return true
+      })
+      .slice(0, MAX_CANDIDATES)
+
+    const resolved = await Promise.all(candidates.map(async (m): Promise<Recommendation | null> => {
+      const files = await listGgufFiles(m.id, token).catch(() => [] as GgufFile[])
+      const pick = pickFile(files, system, m.profile.parameters ?? 0)
+      if (!pick) return null
+      return { repo: m.id, file: pick.file.file, parts: pick.file.parts, size: pick.file.size, quant: pick.file.quant, downloads: m.downloads, profile: m.profile, fit: pick.fit }
+    }))
+    // Fast options first (entirely on the GPU), then a few stronger ones that run slower.
+    const trusted = (r: Recommendation) => (TRUSTED_PUBLISHER.test(r.repo) ? 1 : 0)
+    const bySize = (a: Recommendation, b: Recommendation) => trusted(b) - trusted(a) || (b.profile.parameters ?? 0) - (a.profile.parameters ?? 0)
+    const ready = resolved.filter((r): r is Recommendation => r !== null)
+    const fast = ready.filter((r) => r.fit.level === 'gpu').sort(bySize).slice(0, MAX_FAST)
+    const slower = ready.filter((r) => r.fit.level !== 'gpu')
+    // Stronger models that still chat at a tolerable speed come first; very slow giants only fill the gap.
+    const usable = slower.filter((r) => (r.fit.tokensPerSecond?.[0] ?? 0) >= USABLE_TPS).sort(bySize)
+    const crawling = slower.filter((r) => (r.fit.tokensPerSecond?.[0] ?? 0) < USABLE_TPS).sort((a, b) => FIT_RANK[b.fit.level] - FIT_RANK[a.fit.level] || bySize(b, a))
+    const stronger = [...usable, ...crawling].slice(0, MAX_STRONGER)
+    const value = [...fast, ...stronger]
+    recommendCache = { at: Date.now(), key, value }
+    return value
+  }
+
   const downloading = new Map<string, AbortController>()
 
   /** Path of a GGUF model's entry file on disk, or null for an invalid id. */
@@ -211,6 +301,9 @@ export function registerModelIpc(deps: Deps) {
     if (!target.startsWith(root + path.sep)) throw new Error('Некорректный путь')
     await fs.promises.rm(target, { recursive: true, force: true })
   })
+
+  ipcMain.handle('system:info', () => getSystem())
+  ipcMain.handle('hf:recommend', async () => recommend(await getSystem()))
 
   ipcMain.handle('hf:authStatus', () => auth.status())
   ipcMain.handle('hf:login', () => auth.login())

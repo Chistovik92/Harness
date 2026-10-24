@@ -5,6 +5,7 @@ import path from 'node:path'
 import http from 'node:http'
 import crypto from 'node:crypto'
 import { buildProfile, parametersFromName } from '../renderer/lib/modelProfile'
+import { estimateFit, q4WeightsBytes, type SystemInfo } from '../renderer/lib/modelFit'
 import { HfAuth, pkcePair, authorizeUrl, HF_CLIENT_ID, type StoredAuth } from '../electron/hfAuth'
 import { EncryptedStore } from '../electron/store'
 import { generateKey } from '../electron/secureStore'
@@ -204,5 +205,35 @@ describe('GGUF hub client', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('model fit estimate', () => {
+  const GB = 1024 ** 3
+  // The reporter's machine: RTX 2080 (8 GB, 7.3 free), 32 GB RAM (19 free).
+  const rtx2080: SystemInfo = { backend: 'vulkan', gpuName: 'NVIDIA GeForce RTX 2080', vramTotal: 8 * GB, vramFree: 7.3 * GB, totalRam: 31.9 * GB, freeRam: 19.1 * GB, cpuCores: 12, cpuModel: 'i7-8700K' }
+  const cpuOnly: SystemInfo = { ...rtx2080, backend: 'cpu', gpuName: null, vramTotal: 0, vramFree: 0 }
+
+  it('puts a 7B Q4 model fully on the GPU and a 27B model on the CPU/partially', () => {
+    const small = estimateFit(4.7 * GB, rtx2080)
+    expect(small.level).toBe('gpu')
+    expect(small.tokensPerSecond![0]).toBeGreaterThan(10)
+
+    const big = estimateFit(16.5 * GB, rtx2080)
+    expect(big.level).toBe('partial')
+    expect(big.tokensPerSecond![1]).toBeLessThan(10)
+
+    expect(estimateFit(10.2 * GB, rtx2080).level).toBe('partial')
+  })
+
+  it('refuses models that cannot fit and flags tight RAM', () => {
+    expect(estimateFit(40 * GB, rtx2080).level).toBe('no')
+    expect(estimateFit(18 * GB, { ...cpuOnly, freeRam: 9 * GB }).level).toBe('tight')
+    expect(estimateFit(8 * GB, cpuOnly).level).toBe('cpu')
+  })
+
+  it('treats a missing GPU as CPU-only and estimates 4-bit weights from parameters', () => {
+    expect(estimateFit(2 * GB, cpuOnly).level).toBe('cpu')
+    expect(q4WeightsBytes(7e9)).toBeCloseTo(4.2e9, -8)
   })
 })

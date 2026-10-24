@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download, Trash2, Search, Check, X, LogIn, LogOut, Lock, ChevronDown } from 'lucide-react'
-import type { AuthStatus, GgufFile, HubModel, LocalModel } from '../electron/preload'
-import { ModelBadges } from '@/components/ModelBadges'
+import type { AuthStatus, GgufFile, HubModel, LocalModel, Recommendation, SystemInfo } from '../electron/preload'
+import { ModelBadges, FitBadge } from '@/components/ModelBadges'
+import { estimateFit, q4WeightsBytes, describeSystem } from '@/lib/modelFit'
 
 type Format = 'gguf' | 'onnx'
 type FileProgress = { loaded: number; total: number }
@@ -33,6 +34,8 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
   const [auth, setAuth] = useState<AuthStatus>({ loggedIn: false })
   const [signingIn, setSigningIn] = useState(false)
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [system, setSystem] = useState<SystemInfo | null>(null)
+  const [recs, setRecs] = useState<Recommendation[] | 'loading' | null>(null)
   const [files, setFiles] = useState<Record<string, GgufFile[] | 'loading'>>({})
   const [downloading, setDownloading] = useState<Record<string, Record<string, FileProgress>>>({})
   const downloadingRef = useRef(downloading)
@@ -56,6 +59,7 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     refreshLocal().catch((err) => setError(cleanError(err)))
     window.__DSH__.hf.authStatus().then(setAuth).catch(() => {})
+    window.__DSH__.system.info().then(setSystem).catch(() => {})
     return window.__DSH__.hf.onProgress((p) => {
       if (p.status === 'progress' && p.file && p.total) {
         setDownloading((prev) => {
@@ -72,6 +76,22 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
     // Re-run only when the tab changes; typing triggers search explicitly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [format])
+
+  async function loadRecommendations() {
+    setRecs('loading')
+    try {
+      setRecs(await window.__DSH__.hf.recommend())
+    } catch (err) {
+      setRecs(null)
+      setError(cleanError(err))
+    }
+  }
+
+  useEffect(() => {
+    if (format === 'gguf' && system && recs === null) void loadRecommendations()
+    // Recommendations depend on the machine: load once when it is known.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [format, system])
 
   async function signIn() {
     setSigningIn(true)
@@ -208,6 +228,45 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
         )}
       </section>
 
+      {system && (
+        <section className="border border-slate-800 rounded-lg p-4 bg-slate-900/50 space-y-1">
+          <div className="text-sm text-slate-100">Ваша система</div>
+          <div className="text-xs text-slate-400">{describeSystem(system)}</div>
+          <div className="text-xs text-slate-500">Подсказки «поместится / скорость» ниже рассчитаны под эти данные (свободная память меняется: закройте тяжёлые программы перед загрузкой большой модели).</div>
+        </section>
+      )}
+
+      {format === 'gguf' && system && (
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-300">Рекомендуем для вашей системы</h2>
+            <button onClick={loadRecommendations} disabled={recs === 'loading'} className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-100 text-xs">{recs === 'loading' ? 'Подбор…' : 'Подобрать заново'}</button>
+          </div>
+          {recs === 'loading' && <div className="text-xs text-slate-500">Подбираю модели с хорошим русским под вашу память…</div>}
+          {Array.isArray(recs) && recs.length === 0 && <div className="text-xs text-slate-500">Подходящих моделей не нашлось</div>}
+          {Array.isArray(recs) && recs.map((r) => {
+            const id = ggufModelId(r.repo, r.file)
+            const isDone = downloaded.has(id)
+            return (
+              <div key={id} className="border border-slate-800 rounded-lg px-4 py-3 bg-slate-900/50 space-y-2">
+                <div className="flex items-center gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-slate-100 truncate">{r.repo}</div>
+                    <div className="text-xs text-slate-500">{r.quant} · {formatBytes(r.size)} · {r.downloads.toLocaleString('ru-RU')} загрузок</div>
+                  </div>
+                  {isDone ? <span className="text-xs text-emerald-300">Скачано</span>
+                    : downloading[id] ? <button onClick={() => window.__DSH__.hf.cancelDownload(id)} aria-label="Отменить" className="p-1.5 text-slate-400 hover:text-red-400"><X className="w-4 h-4" /></button>
+                    : <button onClick={() => downloadGguf(r.repo, { file: r.file, size: r.size, quant: r.quant, parts: r.parts, role: 'main' })} className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs"><Download className="w-3.5 h-3.5" /> Скачать</button>}
+                </div>
+                <FitBadge fit={r.fit} />
+                <ModelBadges profile={r.profile} />
+                <ProgressBar id={id} />
+              </div>
+            )
+          })}
+        </section>
+      )}
+
       <section className="space-y-3">
         <h2 className="text-sm font-semibold text-slate-300">Скачано ({local.length})</h2>
         {local.length === 0 && <div className="text-xs text-slate-500">Пока ничего не скачано</div>}
@@ -221,6 +280,7 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
               </div>
               <button onClick={() => remove(m.id)} aria-label={`Удалить ${m.name}`} className="p-1.5 text-slate-500 hover:text-red-400"><Trash2 className="w-4 h-4" /></button>
             </div>
+            {system && m.format === 'gguf' && <FitBadge fit={estimateFit(m.sizeBytes, system)} />}
             <ModelBadges profile={m.profile} />
           </div>
         ))}
@@ -292,6 +352,7 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
                 <button onClick={() => downloadOnnx(m.id)} className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs"><Download className="w-3.5 h-3.5" /> Скачать</button>
               )}
             </div>
+            {system && m.profile.parameters && <FitBadge fit={estimateFit(q4WeightsBytes(m.profile.parameters), system)} note="в 4-битном виде" />}
             <ModelBadges profile={m.profile} />
             {m.profile && <div className="text-xs text-slate-500">{m.profile.russianNote}</div>}
             {format === 'onnx' && <ProgressBar id={m.id} />}
@@ -325,6 +386,7 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
                 <div className="flex-1 min-w-0">
                   <div className="text-xs text-slate-200 truncate">{f.file}{f.parts.length > 1 ? ` (${f.parts.length} частей)` : ''}</div>
                   <div className="text-xs text-slate-500">{f.quant} · {formatBytes(f.size)}{best === f ? ' · рекомендуется' : ''}{f.role === 'draft' ? ' · draft' : ''}</div>
+                  {system && f.role === 'main' && <FitBadge fit={estimateFit(f.size, system)} compact />}
                 </div>
                 {f.role === 'draft' ? <span className="text-xs text-amber-300 max-w-[14rem] text-right">Вспомогательная (draft) модель: отдельно не работает</span>
                   : isDone ? <span className="text-xs text-emerald-300">Скачано</span>

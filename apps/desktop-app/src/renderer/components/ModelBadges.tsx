@@ -1,4 +1,5 @@
 import { RUSSIAN_LABELS, STRENGTH_LABELS, TIER_LABELS, type ModelProfile, type RussianLevel } from '@/lib/modelProfile'
+import type { Fit, FitLevel } from '@/lib/modelFit'
 
 const RUSSIAN_STYLE: Record<RussianLevel, string> = {
   native: 'bg-emerald-900/40 border-emerald-600/50 text-emerald-200',
@@ -7,6 +8,26 @@ const RUSSIAN_STYLE: Record<RussianLevel, string> = {
   weak: 'bg-orange-900/30 border-orange-700/50 text-orange-200',
   none: 'bg-red-900/30 border-red-700/50 text-red-200',
   unknown: 'bg-slate-800 border-slate-700 text-slate-300',
+}
+
+const FIT_STYLE: Record<FitLevel, string> = {
+  gpu: 'bg-emerald-900/40 border-emerald-600/50 text-emerald-200',
+  partial: 'bg-sky-900/30 border-sky-700/50 text-sky-200',
+  cpu: 'bg-amber-900/30 border-amber-700/50 text-amber-200',
+  tight: 'bg-orange-900/30 border-orange-700/50 text-orange-200',
+  no: 'bg-red-900/30 border-red-700/50 text-red-200',
+}
+
+/** How well a model fits this machine: level, speed estimate and the reason. */
+export function FitBadge({ fit, compact = false, note }: { fit: Fit; compact?: boolean; note?: string }) {
+  return (
+    <div className="space-y-0.5">
+      <span title={fit.detail} className={`inline-block px-1.5 py-0.5 rounded border text-[11px] ${FIT_STYLE[fit.level]}`}>
+        {fit.label}{note ? ` (${note})` : ''}
+      </span>
+      {!compact && <div className="text-xs text-slate-500">{fit.detail}</div>}
+    </div>
+  )
 }
 
 export function formatParameters(n?: number): string | null {

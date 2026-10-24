@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import { fork, type ChildProcess } from 'node:child_process'
 import type { ToolCall, ToolDef, Message } from '../renderer/lib/providers'
 import type { AgentEvent } from './agent/loop'
+import type { SystemInfo } from '../renderer/lib/modelFit'
 import type { ToolResult } from './agent/types'
 
 const IDLE_UNLOAD_MS = 10 * 60 * 1000
@@ -131,6 +132,30 @@ export class GgufEngine {
   dispose() {
     if (this.idleTimer) clearTimeout(this.idleTimer)
     if (this.entry) this.unload(this.entry.child)
+  }
+
+  private systemCache: { at: number; info: SystemInfo } | null = null
+
+  /** Hardware summary from a short-lived probe process (cached briefly: free memory changes). */
+  async probeSystem(maxAgeMs = 30_000): Promise<SystemInfo> {
+    if (this.systemCache && Date.now() - this.systemCache.at < maxAgeMs) return this.systemCache.info
+    const child = fork(this.workerPath, [], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, execArgv: [], stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+    this.stopped.add(child)
+    try {
+      const info = await new Promise<SystemInfo>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('Не удалось определить характеристики видеокарты (таймаут)')), 30_000)
+        child.once('exit', () => { clearTimeout(timer); reject(new Error('Процесс определения характеристик завершился')) })
+        child.on('message', (msg: WorkerMessage & Partial<SystemInfo>) => {
+          if (msg.type === 'system') { clearTimeout(timer); const { type: _tag, ...info } = msg; resolve(info as SystemInfo) }
+          else if (msg.type === 'error') { clearTimeout(timer); reject(new Error(msg.error ?? 'probe failed')) }
+        })
+        child.send({ type: 'probe' })
+      })
+      this.systemCache = { at: Date.now(), info }
+      return info
+    } finally {
+      try { child.kill() } catch { /* already gone */ }
+    }
   }
 
   /** Library errors are English; explain the common ones in plain Russian. */

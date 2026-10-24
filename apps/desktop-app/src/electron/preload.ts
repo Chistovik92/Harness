@@ -5,8 +5,9 @@
 
 import { contextBridge, ipcRenderer } from 'electron'
 import type { ModelProfile } from '../renderer/lib/modelProfile'
+import type { SystemInfo, Fit } from '../renderer/lib/modelFit'
 
-export type { ModelProfile }
+export type { ModelProfile, SystemInfo, Fit }
 
 export type Settings = {
   apiKey?: string
@@ -95,6 +96,16 @@ export type SshConnectionInput = Omit<SshConnectionInfo, 'hasPassword' | 'hasPas
 
 export type HfUser = { name: string; fullName?: string; avatar?: string }
 export type AuthStatus = { loggedIn: boolean; user?: HfUser }
+export type Recommendation = {
+  repo: string
+  file: string
+  parts: string[]
+  size: number
+  quant: string
+  downloads: number
+  profile: ModelProfile
+  fit: Fit
+}
 export type GgufFile = { file: string; size: number; quant: string; parts: string[]; role: 'main' | 'draft' }
 
 export type LocalModel = { id: string; name: string; format: 'onnx' | 'gguf'; downloaded: boolean; sizeBytes: number; profile: ModelProfile }
@@ -137,6 +148,7 @@ type DshApi = {
     listLocal: () => Promise<LocalModel[]>
     search: (format: 'onnx' | 'gguf', query: string) => Promise<HubModel[]>
     ggufFiles: (repoId: string) => Promise<GgufFile[]>
+    recommend: () => Promise<Recommendation[]>
     download: (modelId: string) => Promise<void>
     downloadGguf: (repoId: string, file: string, parts: string[]) => Promise<void>
     authStatus: () => Promise<AuthStatus>
@@ -145,6 +157,9 @@ type DshApi = {
     cancelDownload: (modelId: string) => Promise<void>
     remove: (modelId: string) => Promise<void>
     onProgress: (cb: (p: DownloadProgress) => void) => () => void
+  }
+  system: {
+    info: () => Promise<SystemInfo>
   }
   agent: {
     pickWorkspace: () => Promise<string | null>
@@ -203,6 +218,7 @@ const api: DshApi = {
     listLocal: () => ipcRenderer.invoke('hf:listLocal'),
     search: (format, query) => ipcRenderer.invoke('hf:search', format, query),
     ggufFiles: (repoId) => ipcRenderer.invoke('hf:ggufFiles', repoId),
+    recommend: () => ipcRenderer.invoke('hf:recommend'),
     download: (modelId) => ipcRenderer.invoke('hf:download', modelId),
     downloadGguf: (repoId, file, parts) => ipcRenderer.invoke('hf:downloadGguf', repoId, file, parts),
     authStatus: () => ipcRenderer.invoke('hf:authStatus'),
@@ -211,6 +227,9 @@ const api: DshApi = {
     cancelDownload: (modelId) => ipcRenderer.invoke('hf:cancelDownload', modelId),
     remove: (modelId) => ipcRenderer.invoke('hf:remove', modelId),
     onProgress: (cb) => subscribe('hf:progress', cb),
+  },
+  system: {
+    info: () => ipcRenderer.invoke('system:info'),
   },
   agent: {
     pickWorkspace: () => ipcRenderer.invoke('agent:pickWorkspace'),

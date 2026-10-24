@@ -297,7 +297,7 @@ const hfAuth = new HfAuth(
   (url) => shell.openExternal(url),
 )
 const ggufEngine = new GgufEngine(path.join(__dirname, 'gguf-worker.js'), path.join(USER_DATA, 'gguf.log'))
-const modelIpc = registerModelIpc({ ggufDir: GGUF_DIR, onnxCache: HF_CACHE, workerPath: path.join(__dirname, 'hf-worker.js'), auth: hfAuth })
+const modelIpc = registerModelIpc({ getSystem: () => ggufEngine.probeSystem(), ggufDir: GGUF_DIR, onnxCache: HF_CACHE, workerPath: path.join(__dirname, 'hf-worker.js'), auth: hfAuth })
 const agentIpc = registerAgentIpc(new EncryptedStore<SshConnection[]>(path.join(USER_DATA, 'connections.enc.json'), storageKey, () => []))
 
 // ---- validation ------------------------------------------------------------
