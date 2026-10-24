@@ -31,9 +31,15 @@ type Incoming =
 
 // The library is ESM-only; keep a real dynamic import() under CommonJS output.
 const importEsm = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>
-const MAX_CONTEXT = 8192
-const MIN_CONTEXT = 2048
+// DSH_CONTEXT_CAP lets tests reproduce a memory-starved machine.
+const MAX_CONTEXT = Number(process.env.DSH_CONTEXT_CAP) || 8192
+const MIN_CONTEXT = Math.min(2048, MAX_CONTEXT)
 const THINK_BUDGET_TOKENS = 2048
+/** Below this many tokens the full tool list + agent prompt would eat most of the context. */
+const COMPACT_CONTEXT = 8192
+const CORE_TOOLS = new Set(['read_file', 'write_file', 'edit_file', 'list_dir', 'glob', 'grep', 'bash'])
+/** node-llama-cpp's message when the history (system prompt included) cannot be squeezed into the context. */
+const CONTEXT_FULL = /context shift strategy|fits the context size|context size.*(exceed|too small)/i
 /** VRAM reserved for the context when deciding how many layers to put on the GPU. */
 const GPU_FIT_CONTEXT = 4096
 /** Errors that mean "the model's own chat template could not be applied". */
@@ -52,6 +58,8 @@ let context: any
 let sequence: any
 /** Index into the wrapper chain that worked last, so a broken template is only probed once. */
 let wrapperIndex = 0
+/** Tokens the loaded context can hold; small when memory is tight. */
+let contextTokens = 0
 const aborts = new Map<string, AbortController>()
 const pendingTools = new Map<string, (output: string) => void>()
 let busy: Promise<void> = Promise.resolve()
@@ -124,7 +132,8 @@ async function load(modelPath: string): Promise<void> {
   }
   if (lastError) throw lastError
   sequence = context.getSequence()
-  post({ type: 'loaded', contextSize: Number(context.contextSize) || 0, gpu: llama.gpu || 'cpu' })
+  contextTokens = Number(context.contextSize) || 0
+  post({ type: 'loaded', contextSize: contextTokens, gpu: llama.gpu || 'cpu' })
 }
 
 /** node-llama-cpp accepts a restricted JSON-schema dialect: keep structure, drop prose keys. */
@@ -137,6 +146,23 @@ function cleanSchema(schema: any): any {
     out[key] = cleanSchema(value)
   }
   return out
+}
+
+/** Short descriptions and only the essential tools: small contexts cannot afford the full set. */
+function compactTools(tools: ToolSpec[]): ToolSpec[] {
+  return tools
+    .filter((t) => CORE_TOOLS.has(t.name))
+    .map((t) => ({ ...t, description: (t.description.split(/(?<=[.!?])\s/)[0] ?? t.description).slice(0, 110) }))
+}
+
+/** Replaces the long agent system prompt with a few lines, keeping the workspace and OS facts. */
+function compactSystem(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m) => {
+    if (m.role !== 'system' || !m.content.startsWith('You are an autonomous')) return m
+    const facts = m.content.split('\n').filter((l) => /^(Workspace folder|OS):/.test(l))
+    const intro = "You are a coding assistant that can use tools to read, edit and search files and run commands. Prefer tools over guessing. Reply in the user's language."
+    return { ...m, content: [intro, ...facts].join('\n') }
+  })
 }
 
 function toHistory(messages: ChatMessage[]) {
@@ -154,7 +180,19 @@ async function generate(req: ChatRequest, wrapperIdx: number, signal: AbortSigna
   const wrapper = wrapperChain[wrapperIdx]()
   let session: any
   try {
-    const turns = toHistory(req.messages)
+    let messages = req.messages
+    let tools = req.tools
+    if (tools.length > 0 && contextTokens > 0 && contextTokens < COMPACT_CONTEXT) {
+      tools = compactTools(tools)
+      messages = compactSystem(messages)
+    }
+    // Tool definitions plus the prompt must leave most of the context for the conversation and the answer.
+    const promptTokens = Math.ceil((JSON.stringify(tools).length + messages.reduce((n, m) => n + m.content.length, 0)) / 3)
+    if (tools.length > 0 && contextTokens > 0 && promptTokens > contextTokens * 0.65) {
+      throw new Error(`Контекст модели (${contextTokens} токенов) слишком мал для режима агента: описания инструментов и подсказка занимают около ${promptTokens} токенов. Выберите модель поменьше (тогда останется память под больший контекст) или отключите режим агента.`)
+    }
+    const budget = contextTokens > 0 ? Math.max(256, Math.floor(contextTokens / 2)) : req.maxTokens
+    const turns = toHistory(messages)
     const last = turns.pop()
     if (!last || last.type !== 'user') throw new Error('Последнее сообщение должно быть от пользователя')
 
@@ -163,7 +201,7 @@ async function generate(req: ChatRequest, wrapperIdx: number, signal: AbortSigna
 
     const functions: Record<string, unknown> = {}
     let callCounter = 0
-    for (const tool of req.tools) {
+    for (const tool of tools) {
       functions[tool.name] = lib.defineChatSessionFunction({
         description: tool.description,
         params: cleanSchema(tool.parameters),
@@ -177,7 +215,7 @@ async function generate(req: ChatRequest, wrapperIdx: number, signal: AbortSigna
       })
     }
 
-    const thoughtTokens = req.thinking ? THINK_BUDGET_TOKENS : 0
+    const thoughtTokens = req.thinking ? Math.min(THINK_BUDGET_TOKENS, Math.floor(budget / 2)) : 0
     // With thinking off, reasoning markers (e.g. a bare "Thinking" header) are noise.
     const emitThought = (text: string) => { if (req.thinking && text) post({ type: 'thought', id: req.id, content: text }) }
     const emitText = (raw: string) => {
@@ -189,8 +227,8 @@ async function generate(req: ChatRequest, wrapperIdx: number, signal: AbortSigna
     }
     const router = createThinkRouter(emitText, emitThought)
     await session.prompt(last.text, {
-      ...(req.tools.length > 0 ? { functions } : {}),
-      maxTokens: req.maxTokens + thoughtTokens,
+      ...(tools.length > 0 ? { functions } : {}),
+      maxTokens: Math.min(req.maxTokens, budget) + thoughtTokens,
       temperature: req.temperature,
       topP: 0.9,
       topK: 40,
@@ -231,6 +269,16 @@ async function chat(req: ChatRequest): Promise<void> {
         failure = err
         const message = err instanceof Error ? err.message : String(err)
         log(`wrapper #${i} failed: ${err instanceof Error ? (err.stack ?? message) : message}`)
+        if (CONTEXT_FULL.test(message)) {
+          // A long answer ran into the end of the context: keep what was written instead of failing.
+          if (state.emitted) {
+            post({ type: 'text', id: req.id, content: `\n\n… (ответ оборван: закончился контекст модели, ${contextTokens} токенов)` })
+            post({ type: 'done', id: req.id })
+            return
+          }
+          failure = new Error(`Запрос вместе с подсказкой не помещается в контекст модели (${contextTokens} токенов). Начните новый чат, отключите режим агента или выберите модель поменьше.`)
+          break
+        }
         // Retry with another template only when nothing has been shown yet.
         if (state.emitted || !TEMPLATE_ERROR.test(message)) break
       }
