@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 import { encrypt, decrypt, generateKey, isValidKey } from '../electron/secureStore'
 import { isValidModelId } from '../electron/localHf'
 import { createThinkRouter } from '../electron/thinkRouter'
@@ -181,5 +183,14 @@ describe('createThinkRouter', () => {
   it('does not swallow text that merely starts like a tag, and flushes unfinished thoughts', () => {
     expect(run(['<th', 'at is odd'])).toEqual({ text: '<that is odd', thought: '' })
     expect(run(['<think>unfinished reasoning'])).toEqual({ text: '', thought: 'unfinished reasoning' })
+  })
+})
+
+describe('runtime requirements', () => {
+  it('ships an Electron whose Node understands import attributes (needed by node-llama-cpp)', () => {
+    // Electron < 31 bundles Node < 20.10: importing node-llama-cpp there fails with
+    // "SyntaxError: Unexpected token 'with'" and local GGUF chat never starts.
+    const pkg = JSON.parse(fs.readFileSync(path.resolve('node_modules/electron/package.json'), 'utf8')) as { version: string }
+    expect(Number(pkg.version.split('.')[0])).toBeGreaterThanOrEqual(33)
   })
 })
