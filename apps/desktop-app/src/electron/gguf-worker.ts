@@ -34,6 +34,8 @@ const importEsm = new Function('specifier', 'return import(specifier)') as (spec
 const MAX_CONTEXT = 8192
 const MIN_CONTEXT = 2048
 const THINK_BUDGET_TOKENS = 2048
+/** VRAM reserved for the context when deciding how many layers to put on the GPU. */
+const GPU_FIT_CONTEXT = 4096
 /** Errors that mean "the model's own chat template could not be applied". */
 const TEMPLATE_ERROR = /unexpected token|syntaxerror|jinja|template|chat ?wrapper|is not defined|cannot read propert/i
 
@@ -61,6 +63,26 @@ const wrapperChain: (() => unknown)[] = [
   () => new lib.GeneralChatWrapper(),
 ]
 
+/** Largest context that fits the memory that is actually free, backing off if needed. */
+async function createContext(): Promise<any> {
+  const train = Number(model.trainContextSize) || MAX_CONTEXT
+  const maxContext = Math.min(train, MAX_CONTEXT)
+  try {
+    return await model.createContext({ contextSize: { min: Math.min(MIN_CONTEXT, maxContext), max: maxContext } })
+  } catch (err) {
+    log(`auto context failed, backing off: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  let size = maxContext
+  while (true) {
+    try {
+      return await model.createContext({ contextSize: size })
+    } catch (err) {
+      if (size <= MIN_CONTEXT) throw err
+      size = Math.max(MIN_CONTEXT, Math.floor(size / 2))
+    }
+  }
+}
+
 async function load(modelPath: string): Promise<void> {
   lib = await importEsm('node-llama-cpp')
   const fileName = path.basename(modelPath)
@@ -78,25 +100,29 @@ async function load(modelPath: string): Promise<void> {
     throw new Error(`Модель (${formatGb(weights)}) не поместится в память: свободно ${formatGb(freeRam)} ОЗУ и ${formatGb(freeVram)} видеопамяти. Закройте другие программы или выберите модель меньше (меньше параметров или квантизация Q4 вместо Q8).`)
   }
 
-  model = await llama.loadModel({ modelPath })
-  const train = Number(model.trainContextSize) || MAX_CONTEXT
-  const maxContext = Math.min(train, MAX_CONTEXT)
-  // Let llama.cpp pick the largest context that fits the memory that is actually free.
-  try {
-    context = await model.createContext({ contextSize: { min: Math.min(MIN_CONTEXT, maxContext), max: maxContext } })
-  } catch (err) {
-    log(`auto context failed, backing off: ${err instanceof Error ? err.message : String(err)}`)
-    let size = maxContext
-    while (true) {
-      try {
-        context = await model.createContext({ contextSize: size })
-        break
-      } catch (inner) {
-        if (size <= MIN_CONTEXT) throw inner
-        size = Math.max(MIN_CONTEXT, Math.floor(size / 2))
-      }
+  // Offload as many layers as leave room for the context; if even that does not fit, run on the CPU.
+  const attempts: Record<string, unknown>[] = [
+    { gpuLayers: { fitContext: { contextSize: GPU_FIT_CONTEXT } } },
+    { gpuLayers: 0 },
+  ]
+  let lastError: unknown
+  for (const options of attempts) {
+    try {
+      model = await llama.loadModel({ modelPath, ...options })
+      context = await createContext()
+      lastError = undefined
+      break
+    } catch (err) {
+      lastError = err
+      const message = err instanceof Error ? err.message : String(err)
+      log(`load attempt ${JSON.stringify(options)} failed: ${message}`)
+      try { await model?.dispose() } catch { /* already disposed */ }
+      model = undefined
+      // Only memory problems are worth retrying with another placement.
+      if (!/vram|context size|memory|allocat/i.test(message)) throw err
     }
   }
+  if (lastError) throw lastError
   sequence = context.getSequence()
   post({ type: 'loaded', contextSize: Number(context.contextSize) || 0, gpu: llama.gpu || 'cpu' })
 }

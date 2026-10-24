@@ -68,6 +68,8 @@ export class GgufEngine {
   private entry: Entry | null = null
   private idleTimer: NodeJS.Timeout | null = null
   private nextId = 0
+  /** Children we stopped ourselves: their exit is expected, not a crash. */
+  private readonly stopped = new WeakSet<ChildProcess>()
 
   constructor(private readonly workerPath: string, private readonly logPath?: string) {}
 
@@ -95,7 +97,7 @@ export class GgufEngine {
       child.on('message', onMessage)
       child.once('error', reject)
       child.once('exit', (code, signal) => {
-        this.writeLog(`load: process exited (${describeExit(code, signal)}) stderr: ${stderr.text}`)
+        if (!this.stopped.has(child)) this.writeLog(`load: process exited (${describeExit(code, signal)}) stderr: ${stderr.text}`)
         reject(new Error(explainCrash(code, signal, 'при загрузке модели')))
       })
     })
@@ -106,6 +108,7 @@ export class GgufEngine {
   }
 
   private unload(child: ChildProcess) {
+    this.stopped.add(child)
     try { child.kill() } catch { /* already gone */ }
     if (this.entry?.child === child) this.entry = null
   }
@@ -130,12 +133,20 @@ export class GgufEngine {
     if (this.entry) this.unload(this.entry.child)
   }
 
+  /** Library errors are English; explain the common ones in plain Russian. */
+  private translate(message: string): string {
+    if (/context size of \d+ is too large for the available VRAM/i.test(message)) {
+      return 'Модель вместе с контекстом не помещается в видеопамять. Выберите модель меньше (меньше параметров или квантизация Q4/IQ3 вместо Q8) или закройте программы, занимающие видеопамять.'
+    }
+    return message
+  }
+
   async *chat(opts: GgufChatOptions): AsyncGenerator<AgentEvent> {
     const entry = this.acquire(opts.modelPath)
     try {
       await entry.ready
     } catch (err) {
-      yield { type: 'error', error: this.withLogHint(err instanceof Error ? err.message : String(err)) }
+      yield { type: 'error', error: this.withLogHint(this.translate(err instanceof Error ? err.message : String(err))) }
       return
     }
 
@@ -150,7 +161,7 @@ export class GgufEngine {
       if (msg.type === 'text' && msg.content) push({ type: 'text', content: msg.content })
       else if (msg.type === 'thought' && msg.content) push({ type: 'thought', content: msg.content })
       else if (msg.type === 'done') push({ type: 'text', content: '' }, true)
-      else if (msg.type === 'error') push({ type: 'error', error: this.withLogHint(msg.error ?? 'Ошибка модели') }, true)
+      else if (msg.type === 'error') push({ type: 'error', error: this.withLogHint(this.translate(msg.error ?? 'Ошибка модели')) }, true)
       else if (msg.type === 'tool_request' && msg.callId && msg.name) void this.handleTool(entry.child, msg.callId, msg.name, msg.args ?? {}, opts, push)
     }
     const onExit = (code: number | null, signal: NodeJS.Signals | null) => {

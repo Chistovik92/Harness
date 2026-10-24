@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-desktop-app",
   "productName": "DeepSeek Harness",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Desktop AI assistant — chat, plugins, local history, auto-updates (Windows / Linux / macOS)",
   "author": "DeepSeek AI",
   "license": "MIT",
