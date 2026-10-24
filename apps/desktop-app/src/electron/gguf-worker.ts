@@ -37,7 +37,7 @@ const MAX_CONTEXT = Number(process.env.DSH_CONTEXT_CAP) || 8192
 const MIN_CONTEXT = Math.min(2048, MAX_CONTEXT)
 const THINK_BUDGET_TOKENS = 2048
 /** Below this many tokens the full tool list + agent prompt would eat most of the context. */
-const COMPACT_CONTEXT = 8192
+const COMPACT_CONTEXT = 16384
 const CORE_TOOLS = new Set(['read_file', 'write_file', 'edit_file', 'list_dir', 'glob', 'grep', 'bash'])
 /** node-llama-cpp's message when the history (system prompt included) cannot be squeezed into the context. */
 const CONTEXT_FULL = /context shift strategy|fits the context size|context size.*(exceed|too small)/i
@@ -186,6 +186,15 @@ function compactSystem(messages: ChatMessage[]): ChatMessage[] {
   })
 }
 
+/** Drops the oldest turns so the conversation fits `room` tokens; system messages and the last message stay. */
+function fitHistory(messages: ChatMessage[], room: number, estimate: (ms: ChatMessage[]) => number): ChatMessage[] {
+  const system = messages.filter((m) => m.role === 'system')
+  const rest = messages.filter((m) => m.role !== 'system')
+  while (rest.length > 1 && estimate(rest) > room) rest.shift()
+  while (rest.length > 1 && rest[0].role !== 'user') rest.shift()
+  return [...system, ...rest]
+}
+
 function toHistory(messages: ChatMessage[]) {
   const history: any[] = []
   for (const m of messages) {
@@ -208,8 +217,11 @@ async function generate(req: ChatRequest, wrapperIdx: number, signal: AbortSigna
       messages = compactSystem(messages)
     }
     // Tool definitions plus the prompt must leave most of the context for the conversation and the answer.
-    const promptTokens = Math.ceil((JSON.stringify(tools).length + messages.reduce((n, m) => n + m.content.length, 0)) / 3)
-    if (tools.length > 0 && contextTokens > 0 && promptTokens > contextTokens * 0.65) {
+    const estimate = (ms: ChatMessage[]) => Math.ceil(ms.reduce((n, m) => n + m.content.length, 0) / 3)
+    const fixedTokens = Math.ceil(JSON.stringify(tools).length / 3) + estimate(messages.filter((m) => m.role === 'system'))
+    const promptTokens = fixedTokens
+    if (tools.length > 0 && contextTokens > 0) messages = fitHistory(messages, Math.floor(contextTokens * 0.65) - fixedTokens, estimate)
+    if (tools.length > 0 && contextTokens > 0 && fixedTokens > contextTokens * 0.5) {
       throw new Error(`Контекст модели (${contextTokens} токенов) слишком мал для режима агента: описания инструментов и подсказка занимают около ${promptTokens} токенов. Выберите модель поменьше (тогда останется память под больший контекст) или отключите режим агента.`)
     }
     const budget = contextTokens > 0 ? Math.max(256, Math.floor(contextTokens / 2)) : req.maxTokens

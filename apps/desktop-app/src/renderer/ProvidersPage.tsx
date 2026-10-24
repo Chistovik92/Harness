@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Trash2, Plus, Key, Check } from 'lucide-react'
+import { Trash2, Plus, Key, Check, ArrowLeft } from 'lucide-react'
 import type { ProviderConfig } from '../electron/preload'
 
 export const DEFAULT_PROVIDERS = [
@@ -64,12 +64,65 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
     setEditing(p.id)
   }
 
+  const isBuiltin = (id: string) => DEFAULT_PROVIDERS.some((d) => d.id === id)
+
+  function renderEditor() {
+    const simple = editing !== 'new' && isBuiltin(form.id)
+    const field = 'block text-xs font-medium text-slate-400 mb-1'
+    const input = "w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500"
+    return (
+      <div className="border border-indigo-700/60 rounded-lg p-5 bg-slate-900 mt-3">
+        <h2 className="text-sm font-semibold text-slate-200 mb-4">{editing === 'new' ? 'Добавить провайдера' : `Ключ API: ${form.name}`}</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {!simple && (
+            <>
+              <div>
+                <label className={field}>Имя</label>
+                <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className={input} />
+              </div>
+              <div>
+                <label className={field}>Тип</label>
+                <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value as any })} className={input}>
+                  <option value="openai-compatible">OpenAI-совместимый</option>
+                  <option value="anthropic">Anthropic</option>
+                  <option value="google">Google</option>
+                  <option value="huggingface-api">Hugging Face API</option>
+                  <option value="huggingface-local">Hugging Face локально</option>
+                </select>
+              </div>
+              <div>
+                <label className={field}>Base URL</label>
+                <input value={form.baseUrl ?? ''} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" className={input} />
+              </div>
+            </>
+          )}
+          <div>
+            <label className={field}>API-ключ</label>
+            <input type="password" autoFocus value={form.apiKey ?? ''} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." className={input} />
+          </div>
+          <div>
+            <label className={field}>Модель по умолчанию</label>
+            <input value={form.defaultModel ?? ''} onChange={(e) => setForm({ ...form, defaultModel: e.target.value })} placeholder="deepseek-chat" className={input} />
+          </div>
+          <div className="flex items-center">
+            <input type="checkbox" checked={form.enabled !== false} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} className="w-4 h-4 rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-indigo-500" />
+            <label className="ml-2 text-sm text-slate-300">Включён</label>
+          </div>
+        </div>
+        <div className="mt-4 flex gap-2">
+          <button onClick={() => setEditing(null)} className="px-4 py-2 text-slate-400 hover:text-white">Отмена</button>
+          <button onClick={() => saveProvider({ ...form, id: form.id || (providers.find((p) => p.name === form.name)?.id || crypto.randomUUID()) })} className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium">Сохранить</button>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="p-6 max-w-3xl space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">Провайдеры и ключи API</h1>
         <button onClick={onBack} className="flex items-center gap-1 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800 rounded-lg">
-          <Plus className="w-4 h-4" /> Назад к чату
+          <ArrowLeft className="w-4 h-4" /> Назад к чату
         </button>
       </div>
 
@@ -77,7 +130,8 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
 
       <div className="space-y-3">
         {providers.map((p) => (
-          <div key={p.id} className="border border-slate-800 rounded-lg p-4 bg-slate-900/50 flex flex-col md:flex-row md:items-center gap-4">
+          <div key={p.id}>
+          <div className="border border-slate-800 rounded-lg p-4 bg-slate-900/50 flex flex-col md:flex-row md:items-center gap-4">
             <div className="flex items-center gap-3 flex-1 min-w-0">
               <div className="w-8 h-8 rounded bg-indigo-600 flex items-center justify-center text-xs font-bold shrink-0">
                 {p.kind === 'huggingface-local' ? 'L' : p.kind === 'huggingface-api' ? 'H' : p.name[0]}
@@ -97,9 +151,11 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
               ) : (
                 <span className="px-2 py-1 rounded bg-amber-900/30 border border-amber-700/50 text-amber-200 text-xs">Нужен ключ</span>
               )}
-              <button onClick={() => startEdit(p)} className="p-1.5 text-slate-400 hover:text-white">
-                <Key className="w-4 h-4" />
-              </button>
+              {!p.local && (
+                <button onClick={() => startEdit(p)} className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs">
+                  <Key className="w-3.5 h-3.5" /> {p.apiKey ? 'Изменить ключ' : 'Ввести ключ'}
+                </button>
+              )}
               {!DEFAULT_PROVIDERS.some((d) => d.id === p.id) && (
                 <button onClick={() => removeProvider(p.id)} className="p-1.5 text-slate-500 hover:text-red-400">
                   <Trash2 className="w-4 h-4" />
@@ -107,52 +163,15 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
               )}
             </div>
           </div>
+          {editing === p.id && renderEditor()}
+          </div>
         ))}
+        <button onClick={startAdd} className="flex items-center gap-1 px-3 py-2 rounded-lg border border-dashed border-slate-700 text-slate-300 hover:bg-slate-800 text-sm"><Plus className="w-4 h-4" /> Добавить своего провайдера</button>
       </div>
 
       {error && <div className="p-3 rounded border border-red-700/50 bg-red-900/20 text-red-200 text-sm">{error}</div>}
 
-      {editing && (
-        <div className="border border-slate-800 rounded-lg p-6 bg-slate-900">
-          <h2 className="text-sm font-semibold text-slate-300 mb-4">{editing === 'new' ? 'Добавить провайдера' : 'Редактировать'}</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">Имя</label>
-              <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500" />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">Тип</label>
-              <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value as any })} className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500">
-                <option value="openai-compatible">OpenAI-совместимый</option>
-                <option value="anthropic">Anthropic</option>
-                <option value="google">Google</option>
-                <option value="huggingface-api">Hugging Face API</option>
-                <option value="huggingface-local">Hugging Face локально</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">Base URL</label>
-              <input value={form.baseUrl ?? ''} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500" />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">API-ключ</label>
-              <input type="password" value={form.apiKey ?? ''} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500" />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1">Модель по умолчанию</label>
-              <input value={form.defaultModel ?? ''} onChange={(e) => setForm({ ...form, defaultModel: e.target.value })} placeholder="deepseek-chat" className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500" />
-            </div>
-            <div className="flex items-center">
-              <input type="checkbox" checked={form.enabled !== false} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} className="w-4 h-4 rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-indigo-500" />
-              <label className="ml-2 text-sm text-slate-300">Включён</label>
-            </div>
-          </div>
-          <div className="mt-4 flex gap-2">
-            <button onClick={() => { setEditing(null) }} className="px-4 py-2 text-slate-400 hover:text-white">Отмена</button>
-            <button onClick={() => saveProvider({ ...form, id: form.id || (providers.find((p) => p.name === form.name)?.id || crypto.randomUUID()) })} className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium">Сохранить</button>
-          </div>
-        </div>
-      )}
+      {editing === 'new' && renderEditor()}
     </div>
   )
 }

@@ -53,6 +53,7 @@ export default function SettingsPage({ onSave }: { onSave: () => void }) {
             className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500"
             placeholder="sk-..."
           />
+          <p className="text-xs text-slate-400 mt-1">Ключи OpenAI, Anthropic, Google, Groq, OpenRouter и других вводятся в разделе «Провайдеры API» (левое меню, кнопка «Ввести ключ»).</p>
           <p className="text-xs text-slate-500 mt-1">Получить ключ: <a href="https://platform.deepseek.com/apiKeys" target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline">platform.deepseek.com</a></p>
         </div>
         <div>
