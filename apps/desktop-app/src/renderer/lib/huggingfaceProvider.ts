@@ -31,13 +31,16 @@ export class HuggingFaceProvider extends LLMProvider {
   requiresKey() { return !this.local }
   isConfigured(config: ProviderConfig) { return this.local || Boolean(config.apiKey) }
 
-  async listModels(_config: ProviderConfig): Promise<ModelInfo[]> {
+  async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
     if (this.local) {
       return [
         { id: 'Xenova/llama2.c-stories15M', name: 'Llama2.c Stories (15M, local)', provider: this.id, kind: this.kind, local: true, contextWindow: 2048 },
         { id: 'Xenova/gpt2', name: 'GPT-2 (117M, local)', provider: this.id, kind: this.kind, local: true, contextWindow: 1024 },
       ]
     }
+    // The API mode speaks the OpenAI protocol, so the live /models list works here too.
+    const live = await this.api.listModels(config).catch(() => [])
+    if (live.length > 0) return live
     return [
       { id: 'meta-llama/Meta-Llama-3.1-8B-Instruct', name: 'Llama 3.1 8B (HF API)', provider: this.id, kind: this.kind, contextWindow: 131072 },
       { id: 'google/gemma-2-9b-it', name: 'Gemma 2 9B (HF API)', provider: this.id, kind: this.kind, contextWindow: 8192 },

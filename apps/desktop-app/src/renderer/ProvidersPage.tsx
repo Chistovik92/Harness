@@ -38,8 +38,23 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
   const [error, setError] = useState<string | null>(null)
 
   async function saveProvider(p: ProviderConfig) {
+    const name = p.name.trim()
+    if (!name) {
+      setError('Укажите имя провайдера.')
+      return
+    }
+    if (p.kind === 'openai-compatible' && !p.baseUrl?.trim() && editing === 'new') {
+      setError('Для OpenAI-совместимого провайдера укажите Base URL (например, https://openrouter.ai/api/v1).')
+      return
+    }
+    // Two providers sharing a name would silently overwrite each other's keys.
+    const clash = providers.find((q) => q.name.toLowerCase() === name.toLowerCase() && q.id !== p.id)
+    if (clash) {
+      setError(`Провайдер с именем «${name}» уже существует.`)
+      return
+    }
     try {
-      await window.__DSH__.providers.set(p)
+      await window.__DSH__.providers.set({ ...p, name, id: p.id || crypto.randomUUID() })
       setError(null)
       await load()
       setEditing(null)
@@ -111,7 +126,7 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
         </div>
         <div className="mt-4 flex gap-2">
           <button onClick={() => setEditing(null)} className="px-4 py-2 text-slate-400 hover:text-white">Отмена</button>
-          <button onClick={() => saveProvider({ ...form, id: form.id || (providers.find((p) => p.name === form.name)?.id || crypto.randomUUID()) })} className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium">Сохранить</button>
+          <button onClick={() => saveProvider(form)} className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-lg font-medium">Сохранить</button>
         </div>
       </div>
     )

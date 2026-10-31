@@ -67,12 +67,17 @@ export default function App() {
 
   useEffect(() => {
     if (selectedProvider) {
+      // Guard against races: a slow response for an earlier provider must not
+      // overwrite the model list of the currently selected one.
+      let stale = false
       ;(async () => {
         const ms = await window.__DSH__.providers.listModels(selectedProvider)
+        if (stale) return
         setModels(ms)
         // Keep the current choice when it is still available (e.g. after visiting the models page).
         setSelectedModel((prev) => (ms.some((m) => m.id === prev) ? prev : ms.length > 0 ? ms[0].id : ''))
       })().catch((err) => console.error('Failed to load models:', err))
+      return () => { stale = true }
     }
   }, [selectedProvider, view])
 
@@ -162,7 +167,7 @@ export default function App() {
           <button onClick={() => setView('chat')} className="w-8 h-8 rounded hover:bg-slate-800 flex items-center justify-center text-slate-300 hover:text-white"><X className="w-4 h-4" /></button>
           <span className="text-sm font-medium tracking-tight ml-2">Настройки</span>
         </div>
-        <div className="flex-1 overflow-y-auto p-6"><SettingsPage onSave={() => setView('chat')} /></div>
+        <div className="flex-1 overflow-y-auto p-6"><SettingsPage onSave={() => setView('chat')} onOpenProviders={() => setView('providers')} /></div>
       </div>
     )
   }

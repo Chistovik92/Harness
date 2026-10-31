@@ -5,7 +5,7 @@
  */
 
 import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
-import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
+import { readSSE, errorMessage, isAbortError, httpErrorChunk, resilientFetch } from './sse'
 
 export function parseToolArguments(raw: string): Record<string, unknown> {
   if (!raw.trim()) return {}
@@ -49,9 +49,40 @@ export class OpenAICompatibleProvider extends LLMProvider {
   requiresKey() { return true }
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
+  /**
+   * Live model list from GET /models; falls back to the configured default
+   * model when the endpoint is unavailable, so offline or non-standard
+   * providers still offer a working choice.
+   */
   async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
-    const id = config.defaultModel || this.defaultModel
-    return [{ id, name: id, provider: this.id, kind: this.kind, contextWindow: 4096 }]
+    const fallback: ModelInfo[] = [{
+      id: config.defaultModel || this.defaultModel,
+      name: config.defaultModel || this.defaultModel,
+      provider: this.id, kind: this.kind, contextWindow: 4096,
+    }]
+    if (!config.apiKey) return fallback
+    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/+$/, '')
+    try {
+      const res = await resilientFetch(`${base}/models`, {
+        headers: { Authorization: `Bearer ${config.apiKey}` },
+      }, { timeoutMs: 20_000, retries: 0 })
+      if (!res.ok) return fallback
+      const data = await res.json()
+      const raw: unknown = Array.isArray(data) ? data : data?.data
+      if (!Array.isArray(raw)) return fallback
+      const models = raw
+        .map((m: any) => ({
+          id: typeof m === 'string' ? m : String(m?.id ?? ''),
+          name: typeof m === 'string' ? m : String(m?.name ?? m?.id ?? ''),
+          contextWindow: Number(m?.context_length ?? m?.context_window ?? m?.top_provider?.context_length) || undefined,
+        }))
+        .filter((m) => m.id)
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((m) => ({ ...m, provider: this.id, kind: this.kind }))
+      return models.length > 0 ? models : fallback
+    } catch {
+      return fallback
+    }
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {
@@ -74,7 +105,7 @@ export class OpenAICompatibleProvider extends LLMProvider {
     }
 
     try {
-      const res = await fetch(`${base}/chat/completions`, {
+      const res = await resilientFetch(`${base}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
         body: JSON.stringify(body),

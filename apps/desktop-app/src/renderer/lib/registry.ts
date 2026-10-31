@@ -42,7 +42,7 @@ class ProviderRegistry {
       yield { type: 'error', error: `Provider ${providerId} not found` }
       return
     }
-    yield* p.chat({ ...opts, config: this.configFor(providerId) })
+    yield* p.chat({ ...opts, config: { ...this.configFor(providerId), ...opts.config, id: p.id, kind: p.kind } })
   }
 
   private configFor(id: string): ProviderConfig {

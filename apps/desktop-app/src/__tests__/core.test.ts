@@ -4,7 +4,7 @@ import path from 'node:path'
 import { encrypt, decrypt, generateKey, isValidKey } from '../electron/secureStore'
 import { isValidModelId } from '../electron/localHf'
 import { createThinkRouter } from '../electron/thinkRouter'
-import { readSSE } from '../renderer/lib/sse'
+import { readSSE, resilientFetch } from '../renderer/lib/sse'
 import { OpenAICompatibleProvider } from '../renderer/lib/openaiProvider'
 import { GoogleProvider } from '../renderer/lib/googleProvider'
 import { AnthropicProvider } from '../renderer/lib/anthropicProvider'
@@ -147,6 +147,93 @@ describe('AnthropicProvider', () => {
     const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body))
     expect('system' in body).toBe(false)
     expect(body.temperature).toBe(1)
+  })
+})
+
+describe('resilientFetch', () => {
+  it('retries a 500 once and succeeds, and retries transient network errors', async () => {
+    const responses = [new Response('boom', { status: 500 }), new Response('ok')]
+    vi.stubGlobal('fetch', vi.fn(async () => responses.shift()!))
+    const res = await resilientFetch('https://x.test/v1/models')
+    expect(res.status).toBe(200)
+
+    vi.stubGlobal('fetch', vi.fn()
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValueOnce(new Response('ok')))
+    const retry = await resilientFetch('https://x.test/v1/models')
+    expect(retry.status).toBe(200)
+  })
+
+  it('does not retry 4xx or a user abort, and stops after the retry budget', async () => {
+    const fetchMock = vi.fn(async () => new Response('nope', { status: 401 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const res = await resilientFetch('https://x.test', {}, { retries: 2 })
+    expect(res.status).toBe(401)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const fail = vi.fn(async () => { throw new Error('down') })
+    vi.stubGlobal('fetch', fail)
+    await expect(resilientFetch('https://x.test', {}, { retries: 1 })).rejects.toThrow('down')
+    expect(fail).toHaveBeenCalledTimes(2)
+
+    const controller = new AbortController()
+    const aborting = vi.fn(async () => { controller.abort(); throw new DOMException('aborted', 'AbortError') })
+    vi.stubGlobal('fetch', aborting)
+    await expect(resilientFetch('https://x.test', { signal: controller.signal })).rejects.toThrow()
+    expect(aborting).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('dynamic model lists', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('OpenAI-compatible: reads /models, tolerates strings and a broken endpoint', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [
+      { id: 'zeta/model', context_length: 128000 },
+      'plain-id',
+      { id: 'alpha/model', top_provider: { context_length: 32000 } },
+    ] }), { status: 200 })))
+    const p = new OpenAICompatibleProvider(cfg({ baseUrl: 'https://openrouter.test/api/v1' }))
+    const models = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(models.map((m) => m.id)).toEqual(['alpha/model', 'plain-id', 'zeta/model'])
+    expect(models.find((m) => m.id === 'alpha/model')?.contextWindow).toBe(32000)
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })))
+    const fb = await p.listModels(cfg({ apiKey: 'k', defaultModel: 'deepseek-chat' }))
+    expect(fb).toEqual([{ id: 'deepseek-chat', name: 'deepseek-chat', provider: 't', kind: 'openai-compatible', contextWindow: 4096 }])
+
+    const noKey = await p.listModels(cfg({ apiKey: undefined, defaultModel: 'm' }))
+    expect(noKey).toHaveLength(1)
+  })
+
+  it('Anthropic: lists live models and falls back to current defaults', async () => {
+    const p = new AnthropicProvider(cfg({ kind: 'anthropic' }))
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [
+      { id: 'claude-opus-4-5-20251101', display_name: 'Claude Opus 4.5' },
+      { id: 'not-a-claude', display_name: 'X' },
+    ] }), { status: 200 })))
+    const live = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(live.map((m) => m.id)).toEqual(['claude-opus-4-5-20251101'])
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 503 })))
+    const fb = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(fb.some((m) => m.id === 'claude-opus-4-5-20251101')).toBe(true)
+    expect(fb.some((m) => m.id === 'claude-sonnet-4-5-20250929')).toBe(true)
+  })
+
+  it('Google: lists generateContent models with token limits and falls back', async () => {
+    const p = new GoogleProvider(cfg({ kind: 'google' }))
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ models: [
+      { name: 'models/gemini-2.5-pro', displayName: 'Gemini 2.5 Pro', inputTokenLimit: 1048576, supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/text-embedding-004', supportedGenerationMethods: ['embedContent'] },
+    ] }), { status: 200 })))
+    const live = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(live).toEqual([{ id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', provider: 't', kind: 'google', contextWindow: 1048576 }])
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 500 })))
+    const fb = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(fb.some((m) => m.id === 'gemini-2.5-pro')).toBe(true)
+    expect(fb.some((m) => m.id === 'gemini-1.5-pro')).toBe(true)
   })
 })
 

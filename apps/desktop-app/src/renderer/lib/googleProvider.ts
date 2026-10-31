@@ -6,7 +6,7 @@
  */
 
 import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
-import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
+import { readSSE, errorMessage, isAbortError, httpErrorChunk, resilientFetch } from './sse'
 
 type GeminiContent = { role: 'user' | 'model'; parts: Record<string, unknown>[] }
 
@@ -45,11 +45,38 @@ export class GoogleProvider extends LLMProvider {
   requiresKey() { return true }
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
-  async listModels(_config: ProviderConfig): Promise<ModelInfo[]> {
-    return [
+  /**
+   * Live model list from GET /v1beta/models; falls back to a curated list of
+   * current models when the API is unavailable.
+   */
+  async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
+    const fallback: ModelInfo[] = [
+      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', provider: this.id, kind: this.kind, contextWindow: 1048576 },
+      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: this.id, kind: this.kind, contextWindow: 1048576 },
+      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: this.id, kind: this.kind, contextWindow: 1048576 },
       { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', provider: this.id, kind: this.kind, contextWindow: 2000000 },
       { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', provider: this.id, kind: this.kind, contextWindow: 1000000 },
     ]
+    if (!config.apiKey) return fallback
+    try {
+      const res = await resilientFetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', {
+        headers: { 'x-goog-api-key': config.apiKey },
+      }, { timeoutMs: 20_000, retries: 0 })
+      if (!res.ok) return fallback
+      const data = await res.json()
+      if (!Array.isArray(data?.models)) return fallback
+      const models = data.models
+        .filter((m: any) => typeof m?.name === 'string' && m.supportedGenerationMethods?.includes('generateContent'))
+        .map((m: any) => ({
+          id: m.name.replace(/^models\//, ''),
+          name: m.displayName ?? m.name,
+          provider: this.id, kind: this.kind,
+          contextWindow: Number(m?.inputTokenLimit) || undefined,
+        }))
+      return models.length > 0 ? models : fallback
+    } catch {
+      return fallback
+    }
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {
@@ -72,7 +99,7 @@ export class GoogleProvider extends LLMProvider {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`
 
     try {
-      const res = await fetch(url, {
+      const res = await resilientFetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': config.apiKey },
         body: JSON.stringify(body),

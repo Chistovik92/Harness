@@ -4,7 +4,7 @@
  */
 
 import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
-import { readSSE, errorMessage, isAbortError, httpErrorChunk } from './sse'
+import { readSSE, errorMessage, isAbortError, httpErrorChunk, resilientFetch } from './sse'
 import { parseToolArguments } from './openaiProvider'
 
 type AnthropicMessage = { role: 'user' | 'assistant'; content: string | Record<string, unknown>[] }
@@ -52,11 +52,32 @@ export class AnthropicProvider extends LLMProvider {
   requiresKey() { return true }
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
-  async listModels(_config: ProviderConfig): Promise<ModelInfo[]> {
-    return [
+  /**
+   * Live model list from GET /v1/models (Anthropic added this endpoint in 2024);
+   * falls back to a curated list of current models when the API is unavailable.
+   */
+  async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
+    const fallback: ModelInfo[] = [
+      { id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', provider: this.id, kind: this.kind, contextWindow: 200000 },
+      { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', provider: this.id, kind: this.kind, contextWindow: 200000 },
+      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', provider: this.id, kind: this.kind, contextWindow: 200000 },
       { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: this.id, kind: this.kind, contextWindow: 200000 },
-      { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku', provider: this.id, kind: this.kind, contextWindow: 200000 },
     ]
+    if (!config.apiKey) return fallback
+    try {
+      const res = await resilientFetch('https://api.anthropic.com/v1/models?limit=100', {
+        headers: { 'x-api-key': config.apiKey, 'anthropic-version': '2023-06-01' },
+      }, { timeoutMs: 20_000, retries: 0 })
+      if (!res.ok) return fallback
+      const data = await res.json()
+      if (!Array.isArray(data?.data)) return fallback
+      const models = data.data
+        .filter((m: any) => typeof m?.id === 'string' && m.id.startsWith('claude'))
+        .map((m: any) => ({ id: m.id, name: m.display_name ?? m.id, provider: this.id, kind: this.kind, contextWindow: 200000 }))
+      return models.length > 0 ? models : fallback
+    } catch {
+      return fallback
+    }
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {
@@ -79,7 +100,7 @@ export class AnthropicProvider extends LLMProvider {
     if (tools?.length) body.tools = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }))
 
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      const res = await resilientFetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
