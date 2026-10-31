@@ -9,8 +9,8 @@
  */
 
 import { app, BrowserWindow, ipcMain, Menu, Tray, dialog, shell, screen, safeStorage, nativeImage } from 'electron'
-import path from 'node:path'
 import fs from 'node:fs'
+import path from 'node:path'
 
 import { OpenAICompatibleProvider } from '../renderer/lib/openaiProvider'
 import { AnthropicProvider } from '../renderer/lib/anthropicProvider'
@@ -28,7 +28,9 @@ import { HfAuth, type StoredAuth } from './hfAuth'
 import { EncryptedStore } from './store'
 import type { SshConnection } from './agent/remote'
 import type { PermissionMode } from './agent/permissions'
-import { runAgent, executeTool, toolDefs, summarizeCall, buildSystemPrompt, type AgentEvent } from './agent/loop'
+import { runAgent, executeTool, toolDefs, summarizeCall, buildSystemPrompt, loadExtensionsHandle, allToolSpecs, type AgentEvent, type ExtensionsHandle } from './agent/loop'
+import { webSearch, htmlToText } from './agent/tools'
+import { McpManager, loadExtensions, saveExtensions, collectSkills, parseMcpJson, parseOpenCodeConfig, parseCodexConfig, type ExtensionsConfig, type McpServerConfig } from './extensions'
 import { buildProfile } from '../renderer/lib/modelProfile'
 
 // ---- providers -------------------------------------------------------------
@@ -299,7 +301,26 @@ const hfAuth = new HfAuth(
   (url) => shell.openExternal(url),
 )
 const ggufEngine = new GgufEngine(path.join(__dirname, 'gguf-worker.js'), path.join(USER_DATA, 'gguf.log'))
-const modelIpc = registerModelIpc({ getSystem: () => ggufEngine.probeSystem(), ggufDir: GGUF_DIR, onnxCache: HF_CACHE, workerPath: path.join(__dirname, 'hf-worker.js'), auth: hfAuth })
+
+// ---- extensions: MCP servers, skills, model folders -------------------------
+const EXTENSIONS_PATH = path.join(USER_DATA, 'extensions.json')
+const mcpManager = new McpManager(EXTENSIONS_PATH, (file) => loadExtensions(file))
+app.on('before-quit', () => mcpManager.stopAll())
+
+function readExtensions(): ExtensionsConfig {
+  return loadExtensions(EXTENSIONS_PATH)
+}
+
+function writeExtensions(next: ExtensionsConfig): void {
+  saveExtensions(EXTENSIONS_PATH, next)
+}
+
+/** Everything the agent loop needs beyond the built-in tools. */
+async function extensionsHandle(): Promise<ExtensionsHandle> {
+  return loadExtensionsHandle(mcpManager, readExtensions())
+}
+
+const modelIpc = registerModelIpc({ getSystem: () => ggufEngine.probeSystem(), ggufDir: GGUF_DIR, onnxCache: HF_CACHE, workerPath: path.join(__dirname, 'hf-worker.js'), auth: hfAuth, userDataDir: USER_DATA, extensionsFile: EXTENSIONS_PATH, downloadDir: () => readExtensions().ggufDownloadDir, getWindow: () => mainWindow })
 const agentIpc = registerAgentIpc(new EncryptedStore<SshConnection[]>(path.join(USER_DATA, 'connections.enc.json'), storageKey, () => []))
 
 // ---- validation ------------------------------------------------------------
@@ -455,7 +476,7 @@ ipcMain.handle('window:minimize', () => mainWindow?.minimize())
 const MAX_MESSAGES = 500
 const ROLES = new Set(['system', 'user', 'assistant'])
 
-type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string; agent: boolean; thinking: boolean }
+type ChatRequest = { providerId: string; model: string; messages: Message[]; temperature: number; maxTokens: number; signalId: string; agent: boolean; thinking: boolean; web: boolean }
 
 function parseChatRequest(raw: any): ChatRequest {
   const providerId = str(raw?.providerId, 100)
@@ -470,10 +491,68 @@ function parseChatRequest(raw: any): ChatRequest {
     .map((m: any) => ({ role: m.role, content: m.content }))
   if (messages.length === 0) throw new Error('No non-empty messages to send')
   return {
-    providerId, model, messages, signalId, agent: raw.agent === true, thinking: raw.thinking === true,
+    providerId, model, messages, signalId, agent: raw.agent === true, thinking: raw.thinking === true, web: raw.web === true,
     temperature: clamp(raw.temperature, 0, 2, 0.7),
     maxTokens: Math.round(clamp(raw.maxTokens, 1, 131072, 4096)),
   }
+}
+
+/**
+ * Plain-chat web access: URLs in the user's message are fetched, and search-like
+ * questions get a DuckDuckGo lookup. The snippets are injected as context, so
+ * every model (including local GGUF ones) can answer with current facts.
+ */
+const WEB_CONTEXT_URLS = 3
+const WEB_CONTEXT_CHARS = 6000
+const URL_IN_TEXT = /https?:\/\/[^\s<>"')\]]+/g
+
+async function buildWebContext(messages: Message[], signal: AbortSignal): Promise<string | null> {
+  const last = [...messages].reverse().find((m) => m.role === 'user')
+  if (!last) return null
+  const parts: string[] = []
+
+  const urls = [...new Set((last.content.match(URL_IN_TEXT) ?? []).map((u) => u.replace(/[.,;:!?)]+$/, '')))].slice(0, WEB_CONTEXT_URLS)
+  for (const url of urls) {
+    try {
+      const res = await fetchUrl(url, signal)
+      parts.push(`Содержимое ${url}:\n${res.slice(0, WEB_CONTEXT_CHARS)}`)
+    } catch (err) {
+      parts.push(`Содержимое ${url}: недоступно (${err instanceof Error ? err.message : err})`)
+    }
+    if (signal.aborted) return null
+  }
+
+  // A search-shaped question: current/news/price/score/«что такое … сегодня».
+  if (/\b(сегодня|сейчас|последн|новост|актуальн|курс|цена|погода|who is|latest|news|price|today|current)\b/i.test(last.content) && urls.length === 0) {
+    try {
+      const hits = await webSearch(last.content.slice(0, 300), signal, 5)
+      if (hits.length > 0) {
+        parts.push(`Результаты поиска по запросу «${last.content.slice(0, 120)}»:\n${hits.map((h) => `- ${h.title}: ${h.url}${h.snippet ? ` — ${h.snippet.slice(0, 250)}` : ''}`).join('\n')}`)
+      }
+    } catch { /* search is best-effort */ }
+  }
+
+  if (parts.length === 0) return null
+  return [
+    'Web context (fetched automatically; may be incomplete or outdated):',
+    ...parts,
+    'Answer using this context when it is relevant; say so when the context is not enough.',
+  ].join('\n\n')
+}
+
+/** GET a text page, stripped to plain text, size- and time-limited. */
+async function fetchUrl(url: string, signal: AbortSignal, maxBytes = 2 * 1024 * 1024): Promise<string> {
+  const res = await fetch(url, {
+    signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]),
+    headers: { 'User-Agent': 'DeepSeekHarness/1.0', Accept: 'text/html,application/json,text/plain,*/*' },
+    redirect: 'follow',
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const type = res.headers.get('content-type') ?? ''
+  if (!/text|json|xml|javascript|yaml/i.test(type)) throw new Error(`не текстовый ответ (${type})`)
+  const text = await res.text()
+  if (text.length > maxBytes) throw new Error('слишком большой ответ')
+  return /html/i.test(type) ? htmlToText(text).slice(0, WEB_CONTEXT_CHARS * 2) : text
 }
 
 /** Small local models drift into other languages (often Chinese) unless told not to. */
@@ -514,37 +593,50 @@ ipcMain.handle('chat:stream', async (event, raw) => {
     if (req.agent) {
       if (isLocalHf(cfg) && !ggufPath) throw new Error('Агентный режим недоступен для ONNX-моделей: скачайте GGUF-модель или используйте провайдера с API')
       const ctx = agentIpc.createContext(sender, workspace, settings.permissionMode ?? 'workspace-auto', controller.signal)
+      const extensions = await extensionsHandle().catch(() => null)
       try {
         if (ggufPath) {
-          const messages = [{ role: 'system' as const, content: buildSystemPrompt(workspace) }, ...req.messages]
+          const specs = await allToolSpecs(extensions)
+          const messages = [{ role: 'system' as const, content: buildSystemPrompt(workspace, { skills: extensions?.skills ?? [], mcpTools: specs.filter((t) => t.def.name.startsWith('mcp__')).map((t) => t.def.name) }) }, ...req.messages]
           for await (const e of ggufEngine.chat({
-            modelPath: ggufPath, messages, tools: toolDefs(), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal,
+            modelPath: ggufPath, messages, tools: specs.map((t) => t.def), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal,
             contextTokens: settings.gguf?.contextTokens, gpuLayers: settings.gguf?.gpuLayers,
-            runTool: (call) => executeTool(call.name, call.arguments, ctx), summarize: summarizeCall,
+            runTool: (call) => executeTool(call.name, call.arguments, ctx, specs), summarize: (call) => summarizeCall(call, specs),
           })) { sendEvent(e); if (e.type === 'error') break }
         } else {
-          await runAgent({ provider, config: providerConfig, model: req.model, history: req.messages, ctx, temperature: req.temperature, maxTokens: req.maxTokens, onEvent: sendEvent })
+          await runAgent({ provider, config: providerConfig, model: req.model, history: req.messages, ctx, temperature: req.temperature, maxTokens: req.maxTokens, extensions, onEvent: sendEvent })
         }
       } finally {
         ctx.remote.closeAll()
       }
-    } else if (ggufPath) {
-      for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: withLanguagePrompt(req.messages), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, contextTokens: settings.gguf?.contextTokens, gpuLayers: settings.gguf?.gpuLayers })) {
-        sendEvent(e)
-        if (e.type === 'error') break
-      }
     } else {
-      const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
-        ? runLocalModel({
-            workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
-            messages: withLanguagePrompt(req.messages), temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
-            signal: controller.signal,
-          })
-        : provider.chat({ model: req.model, messages: req.messages, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, config: providerConfig })
+      // Web context gives every model — local ones included — fresh facts in plain chat.
+      let messages = req.messages
+      if (req.web) {
+        const webContext = await buildWebContext(req.messages, controller.signal).catch(() => null)
+        if (webContext) {
+          send({ type: 'thought', content: 'Подключаю интернет-контекст…\n' })
+          messages = [{ role: 'system', content: webContext }, ...req.messages]
+        }
+      }
+      if (ggufPath) {
+        for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: withLanguagePrompt(messages), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, contextTokens: settings.gguf?.contextTokens, gpuLayers: settings.gguf?.gpuLayers })) {
+          sendEvent(e)
+          if (e.type === 'error') break
+        }
+      } else {
+        const stream: AsyncGenerator<ChatChunk> = isLocalHf(cfg)
+          ? runLocalModel({
+              workerPath: path.join(__dirname, 'hf-worker.js'), cacheDir: HF_CACHE, model: req.model,
+              messages: withLanguagePrompt(messages), temperature: req.temperature, maxTokens: Math.min(req.maxTokens, 2048),
+              signal: controller.signal,
+            })
+          : provider.chat({ model: req.model, messages, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, config: providerConfig })
 
-      for await (const chunk of stream) {
-        if (chunk.type === 'text' && chunk.content) send(chunk)
-        else if (chunk.type === 'error') { send(chunk); break }
+        for await (const chunk of stream) {
+          if (chunk.type === 'text' && chunk.content) send(chunk)
+          else if (chunk.type === 'error') { send(chunk); break }
+        }
       }
     }
   } catch (err) {
@@ -556,6 +648,97 @@ ipcMain.handle('chat:stream', async (event, raw) => {
 })
 
 ipcMain.handle('chat:cancel', (_e, signalId: string) => { activeStreams.get(signalId)?.abort() })
+
+// ---- IPC: extensions (MCP servers, skills, connectors) -----------------------
+const SKILLS_DIR = path.join(USER_DATA, 'skills')
+
+ipcMain.handle('ext:get', async () => {
+  const cfg = readExtensions()
+  return {
+    mcpServers: cfg.mcpServers,
+    skillDirs: cfg.skillDirs,
+    ggufDownloadDir: cfg.ggufDownloadDir ?? null,
+    skills: collectSkills({ ...cfg, skillDirs: [...new Set([SKILLS_DIR, ...cfg.skillDirs])] }),
+  }
+})
+
+ipcMain.handle('ext:setMcpServer', (_e, raw) => {
+  const id = str(raw?.id, 80) ?? `mcp-${Date.now().toString(36)}`
+  const command = str(raw?.command, 500)
+  if (!command) throw new Error('command обязателен')
+  const server: McpServerConfig = {
+    id,
+    name: str(raw?.name, 120) ?? id,
+    command,
+    args: Array.isArray(raw?.args) ? raw.args.filter((a: unknown): a is string => typeof a === 'string').slice(0, 50) : [],
+    env: raw?.env && typeof raw.env === 'object'
+      ? Object.fromEntries(Object.entries(raw.env).filter(([k, v]) => typeof k === 'string' && typeof v === 'string').slice(0, 30) as [string, string][])
+      : undefined,
+    enabled: raw?.enabled !== false,
+  }
+  const cfg = readExtensions()
+  const idx = cfg.mcpServers.findIndex((s) => s.id === server.id)
+  writeExtensions({ ...cfg, mcpServers: idx >= 0 ? cfg.mcpServers.map((s, i) => (i === idx ? server : s)) : [...cfg.mcpServers, server] })
+  mcpManager.stopAll()
+  return server
+})
+
+ipcMain.handle('ext:removeMcpServer', (_e, id: string) => {
+  const cfg = readExtensions()
+  writeExtensions({ ...cfg, mcpServers: cfg.mcpServers.filter((s) => s.id !== id) })
+  mcpManager.stopAll()
+})
+
+/** Starts every enabled server and reports tool counts; failures come back per server. */
+ipcMain.handle('ext:testMcp', async () => {
+  const tools = await mcpManager.tools()
+  const byServer = new Map<string, number>()
+  for (const t of tools) byServer.set(t.serverId, (byServer.get(t.serverId) ?? 0) + 1)
+  return readExtensions().mcpServers.map((s) => ({ id: s.id, name: s.name, toolCount: byServer.get(s.id) ?? 0, ok: byServer.has(s.id) }))
+})
+
+/** Imports MCP servers from a config file: Claude Code .mcp.json, opencode.json or Codex config.toml. */
+ipcMain.handle('ext:importMcp', async () => {
+  const options: Electron.OpenDialogOptions = {
+    properties: ['openFile'],
+    filters: [{ name: 'Конфиг MCP', extensions: ['json', 'toml'] }, { name: 'Все файлы', extensions: ['*'] }],
+  }
+  const win = mainWindow
+  const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+  const file = result.filePaths[0]
+  if (!file) return { imported: 0 }
+  const text = await fs.promises.readFile(file, 'utf-8')
+  const parsed = file.toLowerCase().endsWith('.toml')
+    ? parseCodexConfig(text)
+    : text.includes('"mcp.servers"') || text.includes('"mcp":')
+      ? parseOpenCodeConfig(text)
+      : parseMcpJson(text)
+  if (parsed.length === 0) throw new Error('В файле не найдено MCP-серверов (ожидались mcpServers / mcp.servers / [mcp_servers.*])')
+  const cfg = readExtensions()
+  const existing = new Set(cfg.mcpServers.map((s) => s.id))
+  const fresh = parsed.filter((s) => !existing.has(s.id)).map((s) => ({ ...s, id: existing.has(s.name) ? `${s.id}-${Date.now().toString(36)}` : s.name }))
+  writeExtensions({ ...cfg, mcpServers: [...cfg.mcpServers, ...fresh].slice(0, 30) })
+  return { imported: fresh.length }
+})
+
+ipcMain.handle('ext:addSkillDir', async () => {
+  const options: Electron.OpenDialogOptions = { properties: ['openDirectory'] }
+  const win = mainWindow
+  const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+  const dir = result.filePaths[0]
+  if (!dir) return null
+  const cfg = readExtensions()
+  if (!cfg.skillDirs.includes(dir)) writeExtensions({ ...cfg, skillDirs: [...cfg.skillDirs, dir].slice(0, 20) })
+  return dir
+})
+
+ipcMain.handle('ext:removeSkillDir', (_e, dir: string) => {
+  const cfg = readExtensions()
+  writeExtensions({ ...cfg, skillDirs: cfg.skillDirs.filter((d) => d !== dir) })
+})
+
+ipcMain.handle('ext:openSkillsFolder', () => { void shell.openPath(SKILLS_DIR) })
+ipcMain.handle('ext:openMcpConfig', () => { void shell.openPath(EXTENSIONS_PATH) })
 
 // ---- auto-updater ----------------------------------------------------------
 type Updater = typeof import('electron-updater').autoUpdater

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Send, Download, Minimize, Folder, ShieldCheck, Server as ServerIcon, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity, ChevronDown } from 'lucide-react'
+import { Send, Download, Minimize, Folder, ShieldCheck, Server as ServerIcon, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity, ChevronDown, Globe, Puzzle } from 'lucide-react'
 import { useDsh } from '@/context/DshContext'
 import { useChat } from '@/context/ChatContext'
 import type { ModelInfo, ToolStep } from '../electron/preload'
@@ -8,6 +8,7 @@ import SettingsPage from './SettingsPage'
 import ProvidersPage, { mergeProviders } from './ProvidersPage'
 import ModelsPage from './ModelsPage'
 import ConnectionsPage from './ConnectionsPage'
+import ExtensionsPage from './ExtensionsPage'
 import { PermissionDialog, ToolSteps } from '@/components/AgentUi'
 import { ModelProfileCard } from '@/components/ModelBadges'
 import { useUpdate } from '@/context/UpdateContext'
@@ -22,11 +23,19 @@ export default function App() {
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null)
   const [models, setModels] = useState<ModelInfo[]>([])
   const [selectedModel, setSelectedModel] = useState<string>('')
-  const [view, setView] = useState<'chat' | 'settings' | 'providers' | 'models' | 'connections'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
+  const [view, setView] = useState<'chat' | 'settings' | 'providers' | 'models' | 'connections' | 'extensions'>(window.location.hash === '#/settings' ? 'settings' : 'chat')
   const { downloaded: updateDownloaded, install: installUpdate } = useUpdate()
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const streamIdRef = useRef<string | null>(null)
+  const [webMode, setWebMode] = useState<boolean>(() => {
+    try { return localStorage.getItem('dsh-web') === '1' } catch { return false }
+  })
+  const toggleWeb = (on: boolean) => {
+    setWebMode(on)
+    try { localStorage.setItem('dsh-web', on ? '1' : '0') } catch { /* storage unavailable */ }
+  }
+
   const [agentMode, setAgentMode] = useState<boolean>(() => {
     try { return localStorage.getItem('dsh-agent-mode') === '1' } catch { return false }
   })
@@ -139,6 +148,7 @@ export default function App() {
         maxTokens: settings.maxTokens ?? 4096,
         signalId: assistantId,
         agent: agentMode,
+        web: webMode,
         thinking: thinkingMode,
       })
       abortRef.current = stream.cancel
@@ -213,6 +223,19 @@ export default function App() {
           <span className="text-sm font-medium tracking-tight ml-2">Локальные модели</span>
         </div>
         <div className="flex-1 overflow-y-auto"><ModelsPage onBack={() => { setView('chat') }} /></div>
+        <PermissionDialog />
+      </div>
+    )
+  }
+
+  if (view === 'extensions') {
+    return (
+      <div className="h-screen flex flex-col bg-slate-900 text-slate-100 overflow-hidden">
+        <div className="flex items-center justify-between h-10 px-4 bg-slate-900/80 border-b border-slate-800 shrink-0 z-10">
+          <button onClick={() => setView('chat')} className="w-8 h-8 rounded hover:bg-slate-800 flex items-center justify-center text-slate-300 hover:text-white"><X className="w-4 h-4" /></button>
+          <span className="text-sm font-medium tracking-tight ml-2">Расширения</span>
+        </div>
+        <div className="flex-1 overflow-y-auto"><ExtensionsPage onBack={() => setView('chat')} /></div>
         <PermissionDialog />
       </div>
     )
@@ -338,6 +361,10 @@ export default function App() {
               <ShieldCheck className="w-4 h-4 text-indigo-300" /> Режим агента
             </label>
             <div className="text-xs text-slate-500">Файлы, поиск, команды, веб и SSH. Работает с моделями API и GGUF.</div>
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer" title="Перед ответом автоматически открыть ссылки из сообщения и поискать свежую информацию в интернете. Работает с любой моделью, включая локальные.">
+              <input type="checkbox" checked={webMode} onChange={(e) => toggleWeb(e.target.checked)} className="w-3.5 h-3.5 rounded bg-slate-950 border-slate-800 text-sky-600 focus:ring-sky-500" />
+              <Globe className="w-3.5 h-3.5 text-sky-300" /> Интернет-контекст
+            </label>
             <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer" title="Модели с рассуждениями (Qwen3 и др.) сначала думают, потом отвечают: точнее, но медленнее. Только для локальных GGUF-моделей.">
               <input type="checkbox" checked={thinkingMode} onChange={(e) => toggleThinking(e.target.checked)} className="w-3.5 h-3.5 rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-indigo-500" />
               Размышления модели (медленнее)
@@ -383,6 +410,7 @@ export default function App() {
             <button onClick={() => setView('connections')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><ServerIcon className="w-4 h-4" /> SSH-подключения</button>
             <button onClick={() => setView('models')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Download className="w-4 h-4" /> Локальные модели</button>
             <button onClick={() => setView('providers')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Key className="w-4 h-4" /> Провайдеры API</button>
+            <button onClick={() => setView('extensions')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm hover:bg-slate-800 text-slate-300"><Puzzle className="w-4 h-4" /> Расширения</button>
           </div>
         </aside>
 

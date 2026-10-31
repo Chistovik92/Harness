@@ -126,7 +126,34 @@ export type StreamOptions = {
   signalId: string
   agent?: boolean
   thinking?: boolean
+  /** Fetch web context (URLs / search) before answering; works for local models too. */
+  web?: boolean
 }
+
+export type McpServerInfo = {
+  id: string
+  name: string
+  command: string
+  args: string[]
+  env?: Record<string, string>
+  enabled: boolean
+}
+
+export type SkillInfo = {
+  dir: string
+  name: string
+  description: string
+  file?: string
+}
+
+export type ExtensionsInfo = {
+  mcpServers: McpServerInfo[]
+  skillDirs: string[]
+  ggufDownloadDir: string | null
+  skills: SkillInfo[]
+}
+
+export type McpTestResult = { id: string; name: string; toolCount: number; ok: boolean }
 
 type DshApi = {
   app: {
@@ -163,6 +190,28 @@ type DshApi = {
     cancelDownload: (modelId: string) => Promise<void>
     remove: (modelId: string) => Promise<void>
     onProgress: (cb: (p: DownloadProgress) => void) => () => void
+    /** Register a .gguf file from anywhere on disk as a usable model. */
+    addExternal: (filePath: string) => Promise<void>
+    removeExternal: (id: string) => Promise<void>
+    /** Folder picker for a .gguf file; returns the chosen path or null. */
+    pickModelFile: () => Promise<string | null>
+    /** Custom download folder for GGUF models (null = default). */
+    getDownloadDir: () => Promise<string | null>
+    setDownloadDir: (dir: string | null) => Promise<string | null>
+    /** Folder picker for the custom download dir; returns the new value or the current one. */
+    pickDownloadDir: () => Promise<string | null>
+  }
+  ext: {
+    get: () => Promise<ExtensionsInfo>
+    setMcpServer: (server: Partial<McpServerInfo> & { command: string }) => Promise<McpServerInfo>
+    removeMcpServer: (id: string) => Promise<void>
+    testMcp: () => Promise<McpTestResult[]>
+    /** Import MCP servers from a Claude Code / opencode / Codex config file. */
+    importMcp: () => Promise<{ imported: number }>
+    addSkillDir: () => Promise<string | null>
+    removeSkillDir: (dir: string) => Promise<void>
+    openSkillsFolder: () => Promise<void>
+    openMcpConfig: () => Promise<void>
   }
   system: {
     info: () => Promise<SystemInfo>
@@ -233,6 +282,24 @@ const api: DshApi = {
     cancelDownload: (modelId) => ipcRenderer.invoke('hf:cancelDownload', modelId),
     remove: (modelId) => ipcRenderer.invoke('hf:remove', modelId),
     onProgress: (cb) => subscribe('hf:progress', cb),
+    addExternal: (filePath) => ipcRenderer.invoke('hf:addExternal', filePath),
+    removeExternal: (id) => ipcRenderer.invoke('hf:removeExternal', id),
+    pickModelFile: () => ipcRenderer.invoke('hf:pickModelFile'),
+    getDownloadDir: () => ipcRenderer.invoke('hf:getDownloadDir'),
+    setDownloadDir: (dir) => ipcRenderer.invoke('hf:setDownloadDir', dir),
+    pickDownloadDir: () => ipcRenderer.invoke('hf:pickDownloadDir'),
+  },
+
+  ext: {
+    get: () => ipcRenderer.invoke('ext:get'),
+    setMcpServer: (server) => ipcRenderer.invoke('ext:setMcpServer', server),
+    removeMcpServer: (id) => ipcRenderer.invoke('ext:removeMcpServer', id),
+    testMcp: () => ipcRenderer.invoke('ext:testMcp'),
+    importMcp: () => ipcRenderer.invoke('ext:importMcp'),
+    addSkillDir: () => ipcRenderer.invoke('ext:addSkillDir'),
+    removeSkillDir: (dir) => ipcRenderer.invoke('ext:removeSkillDir', dir),
+    openSkillsFolder: () => ipcRenderer.invoke('ext:openSkillsFolder'),
+    openMcpConfig: () => ipcRenderer.invoke('ext:openMcpConfig'),
   },
   system: {
     info: () => ipcRenderer.invoke('system:info'),

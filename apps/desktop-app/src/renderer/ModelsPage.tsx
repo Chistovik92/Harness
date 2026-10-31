@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Download, Trash2, Search, Check, X, LogIn, LogOut, Lock, ChevronDown } from 'lucide-react'
+import { Download, Trash2, Search, Check, X, LogIn, LogOut, Lock, ChevronDown, FolderOpen, FilePlus2 } from 'lucide-react'
 import type { AuthStatus, GgufFile, HubModel, LocalModel, Recommendation, SystemInfo } from '../electron/preload'
 import { ModelBadges, FitBadge } from '@/components/ModelBadges'
 import { estimateFit, q4WeightsBytes, describeSystem } from '@/lib/modelFit'
@@ -38,10 +38,42 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
   const [recs, setRecs] = useState<Recommendation[] | 'loading' | null>(null)
   const [files, setFiles] = useState<Record<string, GgufFile[] | 'loading'>>({})
   const [downloading, setDownloading] = useState<Record<string, Record<string, FileProgress>>>({})
+  const [downloadDir, setDownloadDir] = useState<string | null>(null)
   const downloadingRef = useRef(downloading)
   downloadingRef.current = downloading
 
   const refreshLocal = async () => setLocal(await window.__DSH__.hf.listLocal())
+
+  // ---- external .gguf files and the custom download folder ----
+  const addExternalModel = async () => {
+    try {
+      const file = await window.__DSH__.hf.pickModelFile()
+      if (!file) return
+      await window.__DSH__.hf.addExternal(file)
+      await refreshLocal()
+    } catch (err) {
+      setError(cleanError(err))
+    }
+  }
+
+  const removeExternalModel = async (id: string) => {
+    try {
+      await window.__DSH__.hf.removeExternal(id)
+      await refreshLocal()
+    } catch (err) {
+      setError(cleanError(err))
+    }
+  }
+
+  const changeDownloadDir = async () => {
+    try {
+      const dir = await window.__DSH__.hf.pickDownloadDir()
+      setDownloadDir(dir)
+      await refreshLocal()
+    } catch (err) {
+      setError(cleanError(err))
+    }
+  }
 
   async function search(text: string, fmt: Format) {
     setSearching(true)
@@ -57,6 +89,7 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
   }
 
   useEffect(() => {
+    window.__DSH__.hf.getDownloadDir().then(setDownloadDir).catch(() => {})
     refreshLocal().catch((err) => setError(cleanError(err)))
     window.__DSH__.hf.authStatus().then(setAuth).catch(() => {})
     window.__DSH__.system.info().then(setSystem).catch(() => {})
@@ -268,7 +301,12 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
       )}
 
       <section className="space-y-3">
-        <h2 className="text-sm font-semibold text-slate-300">Скачано ({local.length})</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-300">Скачано ({local.length})</h2>
+          <button onClick={() => void addExternalModel()} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm bg-indigo-600 hover:bg-indigo-500 text-white" title="Указать .gguf файл с любого диска — без копирования, модель останется где лежит">
+            <FilePlus2 className="w-4 h-4" /> Добавить свой .gguf
+          </button>
+        </div>
         {local.length === 0 && <div className="text-xs text-slate-500">Пока ничего не скачано</div>}
         {local.map((m) => (
           <div key={m.id} className="border border-slate-800 rounded-lg px-4 py-3 bg-slate-900/50 space-y-2">
@@ -278,12 +316,26 @@ export default function ModelsPage({ onBack }: { onBack: () => void }) {
                 <div className="text-sm text-slate-100 truncate">{m.name}</div>
                 <div className="text-xs text-slate-500">{m.format.toUpperCase()} · {formatBytes(m.sizeBytes)}</div>
               </div>
+              {m.id.startsWith('ext:') && (
+                <button onClick={() => void removeExternalModel(m.id)} aria-label="Убрать из списка" title="Убрать из списка (файл на диске не удаляется)" className="p-1.5 text-slate-500 hover:text-amber-400"><X className="w-4 h-4" /></button>
+              )}
               <button onClick={() => remove(m.id)} aria-label={`Удалить ${m.name}`} className="p-1.5 text-slate-500 hover:text-red-400"><Trash2 className="w-4 h-4" /></button>
             </div>
             {system && m.format === 'gguf' && <FitBadge fit={estimateFit(m.sizeBytes, system)} />}
             <ModelBadges profile={m.profile} />
           </div>
         ))}
+      </section>
+
+      <section className="border border-slate-800 rounded-lg p-4 bg-slate-900/50 space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm text-slate-100 flex items-center gap-2"><FolderOpen className="w-4 h-4 text-indigo-300" /> Папка загрузок GGUF</div>
+            <div className="text-xs text-slate-500 truncate" title={downloadDir ?? ''}>{downloadDir ?? 'По умолчанию (папка приложения)'}</div>
+          </div>
+          <button onClick={() => void changeDownloadDir()} className="px-3 py-1.5 rounded-lg text-sm border border-slate-700 hover:bg-slate-800 text-slate-300 shrink-0">Выбрать папку</button>
+        </div>
+        <div className="text-xs text-slate-500">Выбранная папка сканируется вместе с основной — модели, скачанные туда другими программами, тоже появятся в списке.</div>
       </section>
 
       <div className="flex gap-2 border-b border-slate-800">

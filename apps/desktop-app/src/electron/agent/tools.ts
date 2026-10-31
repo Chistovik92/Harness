@@ -146,7 +146,7 @@ function runShell(command: string, cwd: string, timeoutMs: number, signal: Abort
 
 // ---- web -------------------------------------------------------------------
 
-function htmlToText(html: string): string {
+export function htmlToText(html: string): string {
   return html
     .replace(/<(script|style|noscript|svg)[\s\S]*?<\/\1>/gi, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
@@ -370,8 +370,57 @@ const bashTool: ToolSpec = {
   },
 }
 
-const webFetch: ToolSpec = {
+// ---- web search -------------------------------------------------------------
+
+export type WebSearchHit = { title: string; url: string; snippet: string }
+
+/**
+ * Web search without API keys, via DuckDuckGo's HTML endpoint. Good enough for
+ * agent research; MCP search servers can be added for higher quality.
+ */
+export async function webSearch(query: string, signal: AbortSignal, maxHits = 6): Promise<WebSearchHit[]> {
+  const res = await safeGet(parseHttpUrl(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`), signal)
+  if (!res.ok) throw new ToolError(`Поисковик вернул HTTP ${res.status}`)
+  const html = Buffer.from(await res.arrayBuffer()).toString('utf8')
+  const hits: WebSearchHit[] = []
+  const seen = new Set<string>()
+  const re = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?<\/div>/gi
+  for (const m of html.matchAll(re)) {
+    let url = m[1]
+    // DDG wraps outgoing links: /l/?uddg=<encoded>
+    const uddg = /[?&]uddg=([^&]+)/.exec(url)
+    if (uddg) url = decodeURIComponent(uddg[1])
+    if (!/^https?:\/\//i.test(url)) continue
+    if (seen.has(url)) continue
+    seen.add(url)
+    const strip = (s: string) => htmlToText(s).slice(0, 400)
+    hits.push({ title: strip(m[2]) || url, url, snippet: strip(m[3] ?? '') })
+    if (hits.length >= maxHits) break
+  }
+  return hits
+}
+
+const webSearchTool: ToolSpec = {
   def: {
+    name: 'web_search',
+    description: 'Ищет в интернете (DuckDuckGo) и возвращает список страниц: заголовок, URL, краткое описание. Для содержимого страницы используйте web_fetch.',
+    parameters: obj({
+      query: { type: 'string', description: 'Поисковый запрос' },
+      max_results: { type: 'number', description: 'Сколько результатов (по умолчанию 6, максимум 10)' },
+    }, ['query']),
+  },
+  summarize: (a) => `Поиск в интернете: ${String(a.query)}`,
+  assess: (a) => ({ level: 'safe' } as const),
+  async run(a, ctx) {
+    const query = stringArg(a, 'query').slice(0, 400)
+    if (!query.trim()) throw new ToolError('Пустой поисковый запрос')
+    const hits = await webSearch(query, ctx.signal, numberArg(a, 'max_results', 6, 1, 10))
+    if (hits.length === 0) return 'Ничего не найдено. Попробуйте переформулировать запрос.'
+    return hits.map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}${h.snippet ? `\n   ${h.snippet}` : ''}`).join('\n')
+  },
+}
+
+const webFetch: ToolSpec = {  def: {
     name: 'web_fetch',
     description: 'Загружает http(s)-страницу или API-ответ (GET) и возвращает текст. HTML очищается от разметки.',
     parameters: obj({ url: { type: 'string' }, max_chars: { type: 'number', description: 'Максимум символов (по умолчанию 20000)' } }, ['url']),
@@ -426,6 +475,6 @@ const downloadFile: ToolSpec = {
   },
 }
 
-export const LOCAL_TOOLS: ToolSpec[] = [readFile, writeFile, editFile, listDir, globTool, grepTool, bashTool, webFetch, downloadFile]
+export const LOCAL_TOOLS: ToolSpec[] = [readFile, writeFile, editFile, listDir, globTool, grepTool, bashTool, webSearchTool, webFetch, downloadFile]
 
 export type { ToolArgs }

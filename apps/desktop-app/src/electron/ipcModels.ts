@@ -5,12 +5,13 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { ipcMain, type IpcMainInvokeEvent } from 'electron'
+import { ipcMain, dialog, type IpcMainInvokeEvent } from 'electron'
 import { runLocalModel, isValidModelId, type DownloadProgress } from './localHf'
 import { searchModels, listGgufFiles, downloadHubFile, fetchProfile, REPO_ID, isGgufPath, type GgufFile } from './hfHub'
 import type { HfAuth } from './hfAuth'
 import { buildProfile, type ModelProfile } from '../renderer/lib/modelProfile'
 import { estimateFit, q4WeightsBytes, FIT_RANK, type Fit, type SystemInfo } from '../renderer/lib/modelFit'
+import { loadExtensions, saveExtensions as writeExtensions } from './extensions'
 
 export type LocalModelEntry = {
   id: string
@@ -40,6 +41,49 @@ type Deps = {
   onnxCache: string
   workerPath: string
   auth: HfAuth
+  /** Current custom download folder (extensions.json); undefined = default ggufDir. */
+  downloadDir?: () => string | undefined
+}
+
+/** A user-registered GGUF file that lives anywhere on disk. */
+export type ExternalModelEntry = {
+  id: string
+  name: string
+  path: string
+  sizeBytes: number
+  addedAt: number
+}
+
+const EXTERNAL_FILE = 'external-models.json'
+
+export function externalFilePath(userDataDir: string): string {
+  return path.join(userDataDir, EXTERNAL_FILE)
+}
+
+export function readExternalModels(userDataDir: string): ExternalModelEntry[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(userDataDir, EXTERNAL_FILE), 'utf-8')) as unknown
+    if (!Array.isArray(raw)) return []
+    return raw
+      .filter((e: any) => typeof e?.path === 'string' && e.path.length > 0)
+      .map((e: any, i: number) => ({
+        id: typeof e.id === 'string' && e.id ? e.id : `ext-${i}`,
+        name: typeof e.name === 'string' && e.name ? e.name : path.basename(String(e.path)),
+        path: String(e.path),
+        sizeBytes: typeof e.sizeBytes === 'number' ? e.sizeBytes : 0,
+        addedAt: typeof e.addedAt === 'number' ? e.addedAt : 0,
+      }))
+      .slice(0, 100)
+  } catch {
+    return []
+  }
+}
+
+export function writeExternalModels(userDataDir: string, list: ExternalModelEntry[]): void {
+  const file = path.join(userDataDir, EXTERNAL_FILE)
+  const tmp = `${file}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(list, null, 2))
+  fs.renameSync(tmp, file)
 }
 
 async function dirSize(dir: string): Promise<number> {
@@ -91,8 +135,8 @@ const MAX_FAST = 5
 const USABLE_TPS = 4
 const MAX_STRONGER = 3
 
-export function registerModelIpc(deps: Deps) {
-  const { ggufDir, onnxCache, workerPath, auth, getSystem } = deps
+export function registerModelIpc(deps: Deps & { userDataDir: string; extensionsFile: string; getWindow?: () => Electron.BrowserWindow | null }) {
+  const { ggufDir, onnxCache, workerPath, auth, getSystem, extensionsFile } = deps
   let recommendCache: { at: number; key: string; value: Recommendation[] } | null = null
 
   /** The file of a repository that runs best here; among equals the preferred quantisation. */
@@ -157,6 +201,11 @@ export function registerModelIpc(deps: Deps) {
 
   /** Path of a GGUF model's entry file on disk, or null for an invalid id. */
   const ggufPath = (modelId: string): string | null => {
+    // User-registered external model file.
+    if (modelId.startsWith('ext:')) {
+      const entry = readExternalModels(deps.userDataDir).find((e) => `ext:${e.id}` === modelId)
+      return entry && fs.existsSync(entry.path) ? path.resolve(entry.path) : null
+    }
     const parsed = parseGgufId(modelId)
     if (!parsed) return null
     const root = path.resolve(ggufDir)
@@ -184,37 +233,54 @@ export function registerModelIpc(deps: Deps) {
   }
 
   async function listGguf(): Promise<LocalModelEntry[]> {
-    if (!fs.existsSync(ggufDir)) return []
-    const root = path.resolve(ggufDir)
+    // The custom download folder is scanned in addition to the default one.
+    const custom = deps.downloadDir?.()
+    const roots = [...new Set([path.resolve(ggufDir), ...(custom ? [path.resolve(custom)] : [])])]
     const found: LocalModelEntry[] = []
-    for await (const file of walkFiles(root)) {
-      if (!file.toLowerCase().endsWith('.gguf')) continue
-      const rel = path.relative(root, file).split(path.sep).join('/')
-      const shard = SHARD.exec(rel)
-      if (shard && shard[1] !== '00001') continue
-      const [org, repo, ...rest] = rel.split('/')
-      const id = `${GGUF_PREFIX}${org}/${repo}/${rest.join('/')}`
-      if (!parseGgufId(id)) continue
-      let sizeBytes = (await fs.promises.stat(file)).size
-      if (shard) {
-        const prefix = file.slice(0, file.length - shard[0].length)
-        for (const sibling of await fs.promises.readdir(path.dirname(file))) {
-          const full = path.join(path.dirname(file), sibling)
-          if (full !== file && full.startsWith(prefix) && SHARD.test(sibling)) sizeBytes += (await fs.promises.stat(full)).size
+    const seen = new Set<string>()
+    for (const root of roots) {
+      if (!fs.existsSync(root)) continue
+      for await (const file of walkFiles(root)) {
+        if (!file.toLowerCase().endsWith('.gguf')) continue
+        const rel = path.relative(root, file).split(path.sep).join('/')
+        const shard = SHARD.exec(rel)
+        if (shard && shard[1] !== '00001') continue
+        const [org, repo, ...rest] = rel.split('/')
+        const id = `${GGUF_PREFIX}${org}/${repo}/${rest.join('/')}`
+        if (!parseGgufId(id) || seen.has(id)) continue
+        seen.add(id)
+        let sizeBytes = (await fs.promises.stat(file)).size
+        if (shard) {
+          const prefix = file.slice(0, file.length - shard[0].length)
+          for (const sibling of await fs.promises.readdir(path.dirname(file))) {
+            const full = path.join(path.dirname(file), sibling)
+            if (full !== file && full.startsWith(prefix) && SHARD.test(sibling)) sizeBytes += (await fs.promises.stat(full)).size
+          }
         }
+        const stored = await readStoredProfile(path.join(root, org, repo))
+        found.push({
+          id, name: `${org}/${repo} · ${path.basename(rest.join('/'))}`, format: 'gguf', downloaded: true, sizeBytes,
+          profile: stored ?? buildProfile({ id: `${org}/${repo}`, runtime: 'gguf', parameters: undefined }),
+        })
       }
-      const stored = await readStoredProfile(path.join(root, org, repo))
-      found.push({
-        id, name: `${org}/${repo} · ${path.basename(rest.join('/'))}`, format: 'gguf', downloaded: true, sizeBytes,
-        profile: stored ?? buildProfile({ id: `${org}/${repo}`, runtime: 'gguf', parameters: undefined }),
-      })
     }
     return found
   }
 
   async function listLocalModels(): Promise<LocalModelEntry[]> {
     const [onnx, gguf] = await Promise.all([listOnnx().catch(() => []), listGguf().catch(() => [])])
-    return [...gguf, ...onnx]
+    // User-registered GGUF files from anywhere on disk.
+    const external: LocalModelEntry[] = readExternalModels(deps.userDataDir)
+      .filter((e) => fs.existsSync(e.path))
+      .map((e) => ({
+        id: `ext:${e.id}`,
+        name: `${e.name} (внешняя)`,
+        format: 'gguf' as const,
+        downloaded: true as const,
+        sizeBytes: e.sizeBytes || (fs.statSync(e.path).size ?? 0),
+        profile: buildProfile({ id: e.name.replace(/\.gguf$/i, ''), runtime: 'gguf' }),
+      }))
+    return [...gguf, ...external, ...onnx]
   }
 
   const withProgress = (event: IpcMainInvokeEvent, modelId: string) => (p: { file?: string; loaded?: number; total?: number; status?: string }) => {
@@ -270,13 +336,16 @@ export function registerModelIpc(deps: Deps) {
     await startDownload(modelId, async (signal) => {
       const token = await auth.getToken()
       const progress = withProgress(event, modelId)
+      // The custom download folder keeps its own org/repo structure.
+      const targetRoot = path.resolve(deps.downloadDir?.() ?? ggufDir)
+      await fs.promises.mkdir(targetRoot, { recursive: true })
       for (const part of entries) {
-        const destination = path.resolve(ggufDir, repoId, part)
-        if (!destination.startsWith(path.resolve(ggufDir) + path.sep)) throw new Error('Некорректный путь файла')
+        const destination = path.resolve(targetRoot, repoId, part)
+        if (!destination.startsWith(targetRoot + path.sep)) throw new Error('Некорректный путь файла')
         await downloadHubFile({ repoId, file: part, destination, token, signal, onProgress: progress })
       }
       const profile = await fetchProfile(repoId, 'gguf', token).catch(() => buildProfile({ id: repoId, runtime: 'gguf' }))
-      await fs.promises.writeFile(path.join(ggufDir, ...repoId.split('/'), PROFILE_FILE), JSON.stringify(profile)).catch(() => {})
+      await fs.promises.writeFile(path.join(targetRoot, ...repoId.split('/'), PROFILE_FILE), JSON.stringify(profile)).catch(() => {})
       completed(event, modelId)
     })
   })
@@ -308,6 +377,63 @@ export function registerModelIpc(deps: Deps) {
   ipcMain.handle('hf:authStatus', () => auth.status())
   ipcMain.handle('hf:login', () => auth.login())
   ipcMain.handle('hf:logout', () => auth.logout())
+
+  // ---- external GGUF files & download folder --------------------------------
+
+  ipcMain.handle('hf:addExternal', async (_e, filePath: string) => {
+    if (typeof filePath !== 'string' || !filePath.trim()) throw new Error('Не указан файл модели')
+    const full = path.resolve(filePath.trim())
+    if (!full.toLowerCase().endsWith('.gguf')) throw new Error('Поддерживаются только .gguf файлы')
+    const stat = await fs.promises.stat(full).catch(() => { throw new Error('Файл не найден') })
+    if (!stat.isFile()) throw new Error('Это не файл')
+    const list = readExternalModels(deps.userDataDir)
+    if (list.some((e) => path.resolve(e.path) === full)) return list
+    const entry: ExternalModelEntry = {
+      id: `m${Date.now().toString(36)}`,
+      name: path.basename(full, path.extname(full)),
+      path: full, sizeBytes: stat.size, addedAt: Date.now(),
+    }
+    writeExternalModels(deps.userDataDir, [...list, entry].slice(-100))
+    return list
+  })
+
+  ipcMain.handle('hf:removeExternal', (_e, id: string) => {
+    writeExternalModels(deps.userDataDir, readExternalModels(deps.userDataDir).filter((e) => e.id !== id))
+  })
+
+  ipcMain.handle('hf:pickModelFile', async () => {
+    const options: Electron.OpenDialogOptions = { properties: ['openFile'], filters: [{ name: 'GGUF модель', extensions: ['gguf'] }] }
+    const win = deps.getWindow?.() ?? null
+    const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    return result.filePaths[0] ?? null
+  })
+
+  ipcMain.handle('hf:getDownloadDir', () => deps.downloadDir?.() ?? null)
+
+  /** Folder picker for the custom download dir; returns the new value or null. */
+  ipcMain.handle('hf:pickDownloadDir', async () => {
+    const options: Electron.OpenDialogOptions = { properties: ['openDirectory'] }
+    const win = deps.getWindow?.() ?? null
+    const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    const dir = result.filePaths[0]
+    if (!dir) return deps.downloadDir?.() ?? null
+    const value = path.resolve(dir)
+    const cfg = loadExtensions(extensionsFile)
+    writeExtensions(extensionsFile, { ...cfg, ggufDownloadDir: value })
+    return value
+  })
+
+  ipcMain.handle('hf:setDownloadDir', async (_e, dir: string | null) => {
+    if (dir !== null && (typeof dir !== 'string' || !dir.trim())) throw new Error('Некорректная папка')
+    const value = dir === null ? undefined : path.resolve(dir.trim())
+    if (value) {
+      const stat = await fs.promises.stat(value).catch(() => null)
+      if (!stat?.isDirectory()) throw new Error('Папка не найдена')
+    }
+    const cfg = loadExtensions(extensionsFile)
+    writeExtensions(extensionsFile, { ...cfg, ...(value ? { ggufDownloadDir: value } : { ggufDownloadDir: undefined }) })
+    return value ?? null
+  })
 
   return { listLocalModels, ggufPath }
 }
