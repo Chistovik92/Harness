@@ -63,7 +63,7 @@ export class GoogleProvider extends LLMProvider {
         headers: { 'x-goog-api-key': config.apiKey },
       }, { timeoutMs: 20_000, retries: 0 })
       if (!res.ok) return fallback
-      const data = await res.json()
+      const data = await res.json() as { models?: any[] }
       if (!Array.isArray(data?.models)) return fallback
       const models = data.models
         .filter((m: any) => typeof m?.name === 'string' && m.supportedGenerationMethods?.includes('generateContent'))

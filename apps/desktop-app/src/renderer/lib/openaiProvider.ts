@@ -67,8 +67,8 @@ export class OpenAICompatibleProvider extends LLMProvider {
         headers: { Authorization: `Bearer ${config.apiKey}` },
       }, { timeoutMs: 20_000, retries: 0 })
       if (!res.ok) return fallback
-      const data = await res.json()
-      const raw: unknown = Array.isArray(data) ? data : data?.data
+      const data = await res.json() as unknown
+      const raw: unknown = Array.isArray(data) ? data : (data as { data?: unknown[] })?.data
       if (!Array.isArray(raw)) return fallback
       const models = raw
         .map((m: any) => ({

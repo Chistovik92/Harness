@@ -69,7 +69,7 @@ export class AnthropicProvider extends LLMProvider {
         headers: { 'x-api-key': config.apiKey, 'anthropic-version': '2023-06-01' },
       }, { timeoutMs: 20_000, retries: 0 })
       if (!res.ok) return fallback
-      const data = await res.json()
+      const data = await res.json() as { data?: unknown[] }
       if (!Array.isArray(data?.data)) return fallback
       const models = data.data
         .filter((m: any) => typeof m?.id === 'string' && m.id.startsWith('claude'))
