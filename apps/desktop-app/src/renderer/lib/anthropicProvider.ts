@@ -6,6 +6,7 @@
 import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
 import { readSSE, errorMessage, isAbortError, httpErrorChunk, resilientFetch } from './sse'
 import { parseToolArguments } from './openaiProvider'
+import { ANTHROPIC_MODELS } from './cloudModels'
 
 type AnthropicMessage = { role: 'user' | 'assistant'; content: string | Record<string, unknown>[] }
 
@@ -57,12 +58,9 @@ export class AnthropicProvider extends LLMProvider {
    * falls back to a curated list of current models when the API is unavailable.
    */
   async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
-    const fallback: ModelInfo[] = [
-      { id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', provider: this.id, kind: this.kind, contextWindow: 200000 },
-      { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', provider: this.id, kind: this.kind, contextWindow: 200000 },
-      { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', provider: this.id, kind: this.kind, contextWindow: 200000 },
-      { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', provider: this.id, kind: this.kind, contextWindow: 200000 },
-    ]
+    const toInfo = (m: { id: string; name: string; contextWindow?: number }): ModelInfo =>
+      ({ ...m, provider: this.id, kind: this.kind, contextWindow: m.contextWindow ?? 200000 })
+    const fallback = ANTHROPIC_MODELS.map(toInfo)
     if (!config.apiKey) return fallback
     try {
       const res = await resilientFetch('https://api.anthropic.com/v1/models?limit=100', {
@@ -73,7 +71,7 @@ export class AnthropicProvider extends LLMProvider {
       if (!Array.isArray(data?.data)) return fallback
       const models = data.data
         .filter((m: any) => typeof m?.id === 'string' && m.id.startsWith('claude'))
-        .map((m: any) => ({ id: m.id, name: m.display_name ?? m.id, provider: this.id, kind: this.kind, contextWindow: 200000 }))
+        .map((m: any) => toInfo({ id: m.id, name: m.display_name ?? m.id }))
       return models.length > 0 ? models : fallback
     } catch {
       return fallback

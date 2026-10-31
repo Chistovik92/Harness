@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { Send, Download, Minimize, Folder, ShieldCheck, Server as ServerIcon, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { Send, Download, Minimize, Folder, ShieldCheck, Server as ServerIcon, X, MessageCircle, Settings as SettingsIcon, Search, Upload, Clock, Key, Bot, Server, Cpu, Activity, ChevronDown } from 'lucide-react'
 import { useDsh } from '@/context/DshContext'
 import { useChat } from '@/context/ChatContext'
 import type { ModelInfo, ToolStep } from '../electron/preload'
@@ -12,7 +12,7 @@ import { PermissionDialog, ToolSteps } from '@/components/AgentUi'
 import { ModelProfileCard } from '@/components/ModelBadges'
 import { useUpdate } from '@/context/UpdateContext'
 
-type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number; steps?: ToolStep[]; thinking?: string }
+type ChatMessage = { id: string; role: 'user' | 'assistant' | 'system'; content: string; createdAt: number; steps?: ToolStep[]; thinking?: string; model?: string }
 
 export default function App() {
   const { settings, saveSettings, isConnected, setIsConnected } = useDsh()
@@ -113,7 +113,7 @@ export default function App() {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendMessage() }
   }
 
-  async function sendMessage() {
+  const sendMessage = async () => {
     const text = input.trim()
     if (!text || !selectedProvider || !selectedModel || isLoading) return
 
@@ -123,7 +123,7 @@ export default function App() {
     const history = [...messages, userMsg].map((m) => ({ role: m.role, content: m.content }))
 
     addMessage(userMsg, sessionId)
-    addMessage({ id: assistantId, role: 'assistant', content: '', createdAt: Date.now() }, sessionId)
+    addMessage({ id: assistantId, role: 'assistant', content: '', createdAt: Date.now(), model: selectedModel }, sessionId)
     setInput('')
     setIsLoading(true)
     setIsConnected(true)
@@ -154,6 +154,26 @@ export default function App() {
   const cancelMessage = () => {
     abortRef.current?.()
   }
+
+  // ---- model picker: searchable dropdown, switchable between messages -------
+  const [modelOpen, setModelOpen] = useState(false)
+  const [modelQuery, setModelQuery] = useState('')
+  const pickerRef = useRef<HTMLDivElement>(null)
+  const currentModel = models.find((m) => m.id === selectedModel)
+  const filteredModels = useMemo(() => {
+    const q = modelQuery.trim().toLowerCase()
+    if (!q) return models
+    return models.filter((m) => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))
+  }, [models, modelQuery])
+
+  useEffect(() => {
+    if (!modelOpen) return
+    const onDown = (e: MouseEvent) => { if (!pickerRef.current?.contains(e.target as Node)) setModelOpen(false) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setModelOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
+  }, [modelOpen])
 
   const newSession = () => {
     setInput('')
@@ -261,21 +281,55 @@ export default function App() {
 
           <div className="p-2 border-b border-slate-800">
             <label className="block px-3 py-1 text-xs font-semibold text-slate-500 uppercase">Модель</label>
-            <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-indigo-500"
-            >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name}{m.local ? ' (локально)' : ''}
-                </option>
-              ))}
-            </select>
+            <div ref={pickerRef} className="relative px-2">
+              <button
+                type="button"
+                onClick={() => { setModelOpen((v) => !v); setModelQuery('') }}
+                className="w-full flex items-center justify-between gap-2 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 text-sm focus:outline-none focus:border-indigo-500 hover:border-slate-600"
+                title={currentModel ? `${currentModel.name} — сменить модель` : 'Выбрать модель'}
+              >
+                <span className="truncate text-left">{currentModel ? currentModel.name : models.length > 0 ? 'Выберите модель' : 'Нет моделей'}</span>
+                <ChevronDown className="w-4 h-4 shrink-0 text-slate-400" />
+              </button>
+              {modelOpen && (
+                <div className="absolute z-30 left-2 right-2 mt-1 rounded-lg border border-slate-700 bg-slate-950 shadow-xl">
+                  <div className="p-2 border-b border-slate-800">
+                    <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 rounded-md px-2">
+                      <Search className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                      <input
+                        autoFocus
+                        value={modelQuery}
+                        onChange={(e) => setModelQuery(e.target.value)}
+                        placeholder="Поиск модели…"
+                        className="w-full bg-transparent py-1.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none"
+                      />
+                      <span className="text-xs text-slate-500 shrink-0">{filteredModels.length}</span>
+                    </div>
+                  </div>
+                  <div className="max-h-72 overflow-y-auto py-1">
+                    {filteredModels.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => { setSelectedModel(m.id); setModelOpen(false) }}
+                        className={`w-full text-left px-3 py-1.5 text-sm hover:bg-slate-800 ${m.id === selectedModel ? 'bg-indigo-600/20 text-indigo-200' : 'text-slate-200'}`}
+                        title={m.id}
+                      >
+                        <div className="truncate">{m.name}{m.local ? ' (локально)' : ''}</div>
+                        {m.name !== m.id && <div className="truncate text-xs text-slate-500">{m.id}</div>}
+                      </button>
+                    ))}
+                    {filteredModels.length === 0 && (
+                      <div className="px-3 py-3 text-xs text-slate-500">Ничего не найдено. Добавьте модель в «Провайдеры API» → «Свои модели».</div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
             {isLocalProvider && models.length === 0 && (
               <div className="mt-2 px-1 text-xs text-amber-200">Нет скачанных моделей. Скачайте их в разделе «Локальные модели».</div>
             )}
-            <ModelProfileCard profile={models.find((m) => m.id === selectedModel)?.profile} />
+            <ModelProfileCard profile={currentModel?.profile} />
           </div>
 
           <div className="p-3 border-b border-slate-800 space-y-2">
@@ -340,6 +394,7 @@ export default function App() {
                   <div className={`max-w-[85%] min-w-0 p-3 rounded-2xl ${m.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-slate-800 text-slate-200 rounded-tl-none border border-slate-800'} ${m.role === 'assistant' && streamId === m.id ? 'animate-pulse' : ''}`}>
                     <div className="flex items-baseline gap-2 mb-1">
                       <span className={m.role === 'user' ? 'text-indigo-200 text-xs font-medium' : 'text-slate-400 text-xs font-medium'}>{m.role === 'user' ? 'Вы' : currentProvider?.name || 'Ассистент'}</span>
+                      {m.role === 'assistant' && m.model && <span className="text-xs text-slate-500" title="Модель, создавшая ответ">{m.model}</span>}
                       {m.role === 'assistant' && streamId && streamId === m.id && <span className="text-xs text-slate-500 animate-pulse">пишет…</span>}
                     </div>
                     {m.thinking && (

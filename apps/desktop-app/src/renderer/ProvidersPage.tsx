@@ -3,14 +3,14 @@ import { Trash2, Plus, Key, Check, ArrowLeft } from 'lucide-react'
 import type { ProviderConfig } from '../electron/preload'
 
 export const DEFAULT_PROVIDERS = [
-  { id: 'deepseek', name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-chat' },
-  { id: 'openai', name: 'OpenAI', kind: 'openai-compatible', baseUrl: 'https://api.openai.com/v1', defaultModel: 'gpt-4o-mini' },
-  { id: 'anthropic', name: 'Anthropic', kind: 'anthropic', defaultModel: 'claude-3-5-sonnet-20241022' },
-  { id: 'google', name: 'Google Gemini', kind: 'google', defaultModel: 'gemini-1.5-flash' },
-  { id: 'groq', name: 'Groq', kind: 'openai-compatible', baseUrl: 'https://api.groq.com/openai/v1', defaultModel: 'llama-3.1-70b-versatile' },
-  { id: 'together', name: 'Together AI', kind: 'openai-compatible', baseUrl: 'https://api.together.xyz/v1', defaultModel: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo' },
-  { id: 'openrouter', name: 'OpenRouter', kind: 'openai-compatible', baseUrl: 'https://openrouter.ai/api/v1', defaultModel: 'deepseek/deepseek-chat' },
-  { id: 'huggingface-api', name: 'Hugging Face (API)', kind: 'huggingface-api', defaultModel: 'meta-llama/Meta-Llama-3.1-8B-Instruct' },
+  { id: 'deepseek', name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-v4-pro' },
+  { id: 'openai', name: 'OpenAI', kind: 'openai-compatible', baseUrl: 'https://api.openai.com/v1', defaultModel: 'gpt-6.1' },
+  { id: 'anthropic', name: 'Anthropic', kind: 'anthropic', defaultModel: 'claude-opus-5-5' },
+  { id: 'google', name: 'Google Gemini', kind: 'google', defaultModel: 'gemini-3-pro-preview' },
+  { id: 'groq', name: 'Groq', kind: 'openai-compatible', baseUrl: 'https://api.groq.com/openai/v1', defaultModel: 'meta-llama/llama-4-maverick-17b-128e-instruct' },
+  { id: 'together', name: 'Together AI', kind: 'openai-compatible', baseUrl: 'https://api.together.xyz/v1', defaultModel: 'moonshotai/Kimi-K2-Instruct' },
+  { id: 'openrouter', name: 'OpenRouter', kind: 'openai-compatible', baseUrl: 'https://openrouter.ai/api/v1', defaultModel: 'openrouter/auto' },
+  { id: 'huggingface-api', name: 'Hugging Face (API)', kind: 'huggingface-api', defaultModel: 'meta-llama/Llama-3.3-70B-Instruct' },
   { id: 'huggingface-local', name: 'Hugging Face (Локально)', kind: 'huggingface-local', local: true, defaultModel: 'Xenova/llama2.c-stories15M' },
 ]
 
@@ -117,8 +117,21 @@ export default function ProvidersPage({ onBack }: { onBack: () => void }) {
           </div>
           <div>
             <label className={field}>Модель по умолчанию</label>
-            <input value={form.defaultModel ?? ''} onChange={(e) => setForm({ ...form, defaultModel: e.target.value })} placeholder="deepseek-chat" className={input} />
+            <input value={form.defaultModel ?? ''} onChange={(e) => setForm({ ...form, defaultModel: e.target.value })} placeholder="deepseek-v4-pro" className={input} />
           </div>
+          {!simple && (
+            <div>
+              <label className={field}>Свои модели (по одной в строке)</label>
+              <textarea
+                value={(form.customModels ?? []).join('\n')}
+                onChange={(e) => setForm({ ...form, customModels: e.target.value.split('\n').map((s) => s.trim()).filter(Boolean) })}
+                placeholder={'deepseek-v4-pro\ngpt-6.1\nmeta-llama/Llama-3.3-70B-Instruct'}
+                rows={3}
+                className={input}
+              />
+              <p className="text-xs text-slate-500 mt-1">Добавленные модели появятся в списке моделей провайдера, даже если API их не отдаёт.</p>
+            </div>
+          )}
           <div className="flex items-center">
             <input type="checkbox" checked={form.enabled !== false} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} className="w-4 h-4 rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-indigo-500" />
             <label className="ml-2 text-sm text-slate-300">Включён</label>

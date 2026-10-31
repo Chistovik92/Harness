@@ -44,6 +44,7 @@ export type StoredMessage = {
   createdAt: number
   steps?: ToolStep[]
   thinking?: string
+  model?: string
 }
 
 export async function getSessions(): Promise<StoredSession[]> {

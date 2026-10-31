@@ -9,6 +9,7 @@
 
 import { LLMProvider, type ProviderConfig, type ModelInfo, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
 import { OpenAICompatibleProvider } from './openaiProvider'
+import { HUGGINGFACE_API_MODELS } from './cloudModels'
 
 const HF_ROUTER_URL = 'https://router.huggingface.co/v1'
 
@@ -41,10 +42,7 @@ export class HuggingFaceProvider extends LLMProvider {
     // The API mode speaks the OpenAI protocol, so the live /models list works here too.
     const live = await this.api.listModels(config).catch(() => [])
     if (live.length > 0) return live
-    return [
-      { id: 'meta-llama/Meta-Llama-3.1-8B-Instruct', name: 'Llama 3.1 8B (HF API)', provider: this.id, kind: this.kind, contextWindow: 131072 },
-      { id: 'google/gemma-2-9b-it', name: 'Gemma 2 9B (HF API)', provider: this.id, kind: this.kind, contextWindow: 8192 },
-    ]
+    return HUGGINGFACE_API_MODELS.map((m) => ({ ...m, provider: this.id, kind: this.kind }))
   }
 
   async *chat(opts: ChatOptions & { config: ProviderConfig }): AsyncGenerator<ChatChunk> {

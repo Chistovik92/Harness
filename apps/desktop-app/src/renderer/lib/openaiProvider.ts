@@ -6,6 +6,16 @@
 
 import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
 import { readSSE, errorMessage, isAbortError, httpErrorChunk, resilientFetch } from './sse'
+import { DEEPSEEK_MODELS, OPENAI_MODELS, GROQ_MODELS, TOGETHER_MODELS, OPENROUTER_MODELS, RETIRED_MODEL_IDS } from './cloudModels'
+
+/** Curated fallbacks for the well-known built-in providers. */
+const FALLBACKS: Record<string, { id: string; name: string; contextWindow?: number }[]> = {
+  deepseek: DEEPSEEK_MODELS,
+  openai: OPENAI_MODELS,
+  groq: GROQ_MODELS,
+  together: TOGETHER_MODELS,
+  openrouter: OPENROUTER_MODELS,
+}
 
 export function parseToolArguments(raw: string): Record<string, unknown> {
   if (!raw.trim()) return {}
@@ -50,16 +60,16 @@ export class OpenAICompatibleProvider extends LLMProvider {
   isConfigured(config: ProviderConfig) { return Boolean(config.apiKey) }
 
   /**
-   * Live model list from GET /models; falls back to the configured default
-   * model when the endpoint is unavailable, so offline or non-standard
-   * providers still offer a working choice.
+   * Live model list from GET /models; falls back to a curated list of current
+   * models for known providers (or the configured default model for custom
+   * gateways) when the endpoint is unavailable.
    */
   async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
-    const fallback: ModelInfo[] = [{
-      id: config.defaultModel || this.defaultModel,
-      name: config.defaultModel || this.defaultModel,
-      provider: this.id, kind: this.kind, contextWindow: 4096,
-    }]
+    const toInfo = (m: { id: string; name: string; contextWindow?: number }): ModelInfo =>
+      ({ ...m, provider: this.id, kind: this.kind, contextWindow: m.contextWindow })
+    const fallback: ModelInfo[] = FALLBACKS[this.id]
+      ? FALLBACKS[this.id].map(toInfo)
+      : [{ id: config.defaultModel || this.defaultModel, name: config.defaultModel || this.defaultModel, provider: this.id, kind: this.kind, contextWindow: undefined }]
     if (!config.apiKey) return fallback
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/+$/, '')
     try {
@@ -76,9 +86,9 @@ export class OpenAICompatibleProvider extends LLMProvider {
           name: typeof m === 'string' ? m : String(m?.name ?? m?.id ?? ''),
           contextWindow: Number(m?.context_length ?? m?.context_window ?? m?.top_provider?.context_length) || undefined,
         }))
-        .filter((m) => m.id)
+        .filter((m) => m.id && !RETIRED_MODEL_IDS.has(m.id))
         .sort((a, b) => a.id.localeCompare(b.id))
-        .map((m) => ({ ...m, provider: this.id, kind: this.kind }))
+        .map(toInfo)
       return models.length > 0 ? models : fallback
     } catch {
       return fallback

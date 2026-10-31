@@ -19,6 +19,8 @@ export type Settings = {
   fontSize?: number
   workspace?: string
   permissionMode?: 'ask-all' | 'workspace-auto' | 'full-auto'
+  /** Engine options for local GGUF models; applied on the next model load. */
+  gguf?: { contextTokens?: number; gpuLayers?: number | 'auto' }
 }
 
 export type ProviderConfig = {
@@ -28,6 +30,8 @@ export type ProviderConfig = {
   apiKey?: string
   baseUrl?: string
   defaultModel?: string
+  /** User-added model ids shown in the picker even when the API does not list them. */
+  customModels?: string[]
   enabled: boolean
   local?: boolean
   requiresKey?: boolean
@@ -61,6 +65,8 @@ export type ChatMessage = {
   steps?: ToolStep[]
   /** The model's reasoning, shown in a collapsible block. */
   thinking?: string
+  /** Model id that produced an assistant message (may change mid-session). */
+  model?: string
 }
 
 export type ToolCallInfo = { id: string; name: string; arguments: Record<string, unknown> }

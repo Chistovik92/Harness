@@ -26,7 +26,7 @@ export function DshProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettingsState] = useState<Settings>({})
   const [apiKey, setApiKeyState] = useState('')
   const [baseUrl, setBaseUrlState] = useState('https://api.deepseek.com')
-  const [model, setModelState] = useState('deepseek-chat')
+  const [model, setModelState] = useState('deepseek-v4-pro')
   const [isConnected, setIsConnected] = useState(false)
 
   useEffect(() => {
@@ -34,7 +34,7 @@ export function DshProvider({ children }: { children: React.ReactNode }) {
       setSettingsState(s)
       setApiKeyState(s.apiKey ?? '')
       setBaseUrlState(s.baseUrl ?? 'https://api.deepseek.com')
-      setModelState(s.model ?? 'deepseek-chat')
+      setModelState(s.model ?? 'deepseek-v4-pro')
     }).catch((err) => console.error('Failed to load settings:', err))
   }, [])
 

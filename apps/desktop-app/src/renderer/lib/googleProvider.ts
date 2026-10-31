@@ -7,6 +7,7 @@
 
 import { LLMProvider, type ProviderConfig, type ModelInfo, type Message, type ToolCall, type ChatOptions, type ChatChunk, type ProviderId, type ProviderKind } from './providers'
 import { readSSE, errorMessage, isAbortError, httpErrorChunk, resilientFetch } from './sse'
+import { GOOGLE_MODELS } from './cloudModels'
 
 type GeminiContent = { role: 'user' | 'model'; parts: Record<string, unknown>[] }
 
@@ -50,13 +51,9 @@ export class GoogleProvider extends LLMProvider {
    * current models when the API is unavailable.
    */
   async listModels(config: ProviderConfig): Promise<ModelInfo[]> {
-    const fallback: ModelInfo[] = [
-      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', provider: this.id, kind: this.kind, contextWindow: 1048576 },
-      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: this.id, kind: this.kind, contextWindow: 1048576 },
-      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: this.id, kind: this.kind, contextWindow: 1048576 },
-      { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', provider: this.id, kind: this.kind, contextWindow: 2000000 },
-      { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', provider: this.id, kind: this.kind, contextWindow: 1000000 },
-    ]
+    const toInfo = (m: { id: string; name: string; contextWindow?: number }): ModelInfo =>
+      ({ ...m, provider: this.id, kind: this.kind, contextWindow: m.contextWindow })
+    const fallback = GOOGLE_MODELS.map(toInfo)
     if (!config.apiKey) return fallback
     try {
       const res = await resilientFetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=100', {
@@ -67,10 +64,9 @@ export class GoogleProvider extends LLMProvider {
       if (!Array.isArray(data?.models)) return fallback
       const models = data.models
         .filter((m: any) => typeof m?.name === 'string' && m.supportedGenerationMethods?.includes('generateContent'))
-        .map((m: any) => ({
+        .map((m: any) => toInfo({
           id: m.name.replace(/^models\//, ''),
           name: m.displayName ?? m.name,
-          provider: this.id, kind: this.kind,
           contextWindow: Number(m?.inputTokenLimit) || undefined,
         }))
       return models.length > 0 ? models : fallback

@@ -39,11 +39,11 @@ export function useChat() {
 }
 
 function toStored(m: ChatMessage, sessionId: string): StoredMessage {
-  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}), ...(m.thinking ? { thinking: m.thinking } : {}) }
+  return { id: m.id, sessionId, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}), ...(m.thinking ? { thinking: m.thinking } : {}), ...(m.model ? { model: m.model } : {}) }
 }
 
 function toChat(m: StoredMessage): ChatMessage {
-  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}), ...(m.thinking ? { thinking: m.thinking } : {}) }
+  return { id: m.id, role: m.role, content: m.content, createdAt: m.createdAt, ...(m.steps?.length ? { steps: m.steps } : {}), ...(m.thinking ? { thinking: m.thinking } : {}), ...(m.model ? { model: m.model } : {}) }
 }
 
 export function ChatProvider({ children }: { children: React.ReactNode }) {

@@ -7,6 +7,7 @@ type Settings = {
   maxTokens?: number
   theme?: 'light' | 'dark'
   fontSize?: number
+  gguf?: { contextTokens?: number; gpuLayers?: number | 'auto' }
 }
 
 export default function SettingsPage({ onSave, onOpenProviders }: { onSave: () => void; onOpenProviders: () => void }) {
@@ -16,6 +17,7 @@ export default function SettingsPage({ onSave, onOpenProviders }: { onSave: () =
     maxTokens: settings.maxTokens ?? 4096,
     theme: settings.theme ?? 'dark',
     fontSize: settings.fontSize ?? 14,
+    gguf: settings.gguf ?? {},
   })
 
   useEffect(() => {
@@ -24,6 +26,7 @@ export default function SettingsPage({ onSave, onOpenProviders }: { onSave: () =
       maxTokens: settings.maxTokens ?? 4096,
       theme: settings.theme ?? 'dark',
       fontSize: settings.fontSize ?? 14,
+      gguf: settings.gguf ?? {},
     })
   }, [settings])
 
@@ -47,7 +50,9 @@ export default function SettingsPage({ onSave, onOpenProviders }: { onSave: () =
         </button>
       </div>
 
+      {/* Settings for remote (API) providers */}
       <div className="space-y-4">
+        <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">Удалённая LLM (API)</h2>
         <div className="grid grid-cols-2 gap-4">
           <div>
             <label className="block text-xs font-medium text-slate-400 mb-1">Температура (0 — точно, 2 — креативно)</label>
@@ -69,7 +74,48 @@ export default function SettingsPage({ onSave, onOpenProviders }: { onSave: () =
             />
           </div>
         </div>
+      </div>
 
+      {/* Settings for local GGUF models; applied on the next model load */}
+      <div className="space-y-4">
+        <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">Локальная LLM (GGUF)</h2>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs font-medium text-slate-400 mb-1">Размер контекста (токены)</label>
+            <input
+              type="number" min="512" max="262144" step="512"
+              value={local.gguf.contextTokens ?? ''}
+              placeholder="авто (8192)"
+              onChange={(e) => {
+                const v = e.target.value.trim() === '' ? undefined : Math.max(512, parseInt(e.target.value) || 512)
+                setLocal({ ...local, gguf: { ...local.gguf, contextTokens: v } })
+              }}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500"
+            />
+            <p className="text-xs text-slate-500 mt-1">Сколько диалога модель помнит. Больше — умнее, но тяжелее по памяти.</p>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-400 mb-1">Слои на GPU</label>
+            <select
+              value={local.gguf.gpuLayers === undefined ? 'auto' : local.gguf.gpuLayers === 'auto' ? 'auto' : String(local.gguf.gpuLayers)}
+              onChange={(e) => {
+                const v = e.target.value === 'auto' ? 'auto' as const : Math.max(0, parseInt(e.target.value) || 0)
+                setLocal({ ...local, gguf: { ...local.gguf, gpuLayers: v } })
+              }}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 focus:outline-none focus:border-indigo-500"
+            >
+              <option value="auto">Авто (по свободной видеопамяти)</option>
+              <option value="0">Только CPU</option>
+              <option value="16">16 слоёв</option>
+              <option value="32">32 слоя</option>
+              <option value="999">Все слои</option>
+            </select>
+            <p className="text-xs text-slate-500 mt-1">Больше слоёв на GPU — быстрее ответ. Применяется при следующей загрузке модели.</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-4">
         <div className="grid grid-cols-2 gap-4">
           <div>
             <label className="block text-xs font-medium text-slate-400 mb-1">Тема</label>

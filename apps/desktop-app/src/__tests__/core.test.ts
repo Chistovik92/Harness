@@ -200,10 +200,21 @@ describe('dynamic model lists', () => {
 
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })))
     const fb = await p.listModels(cfg({ apiKey: 'k', defaultModel: 'deepseek-chat' }))
-    expect(fb).toEqual([{ id: 'deepseek-chat', name: 'deepseek-chat', provider: 't', kind: 'openai-compatible', contextWindow: 4096 }])
+    expect(fb).toEqual([{ id: 'deepseek-chat', name: 'deepseek-chat', provider: 't', kind: 'openai-compatible', contextWindow: undefined }])
 
     const noKey = await p.listModels(cfg({ apiKey: undefined, defaultModel: 'm' }))
     expect(noKey).toHaveLength(1)
+  })
+
+  it('OpenAI-compatible: retired model ids are filtered from the live list', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ data: [
+      { id: 'gpt-6.1' },
+      { id: 'gpt-4o-mini' },
+      { id: 'deepseek-chat' },
+    ] }), { status: 200 })))
+    const p = new OpenAICompatibleProvider(cfg({ baseUrl: 'https://openrouter.test/api/v1' }))
+    const models = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(models.map((m) => m.id)).toEqual(['gpt-6.1'])
   })
 
   it('Anthropic: lists live models and falls back to current defaults', async () => {
@@ -217,8 +228,8 @@ describe('dynamic model lists', () => {
 
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 503 })))
     const fb = await p.listModels(cfg({ apiKey: 'k' }))
-    expect(fb.some((m) => m.id === 'claude-opus-4-5-20251101')).toBe(true)
-    expect(fb.some((m) => m.id === 'claude-sonnet-4-5-20250929')).toBe(true)
+    expect(fb.some((m) => m.id === 'claude-opus-5-5')).toBe(true)
+    expect(fb.some((m) => m.id === 'claude-sonnet-5-5')).toBe(true)
   })
 
   it('Google: lists generateContent models with token limits and falls back', async () => {
@@ -232,8 +243,8 @@ describe('dynamic model lists', () => {
 
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 500 })))
     const fb = await p.listModels(cfg({ apiKey: 'k' }))
+    expect(fb.some((m) => m.id === 'gemini-3-pro-preview')).toBe(true)
     expect(fb.some((m) => m.id === 'gemini-2.5-pro')).toBe(true)
-    expect(fb.some((m) => m.id === 'gemini-1.5-pro')).toBe(true)
   })
 })
 

@@ -25,7 +25,7 @@ type ChatRequest = {
 
 type Incoming =
   | { type: 'probe' }
-  | { type: 'load'; modelPath: string }
+  | { type: 'load'; modelPath: string; gpuLayers?: number }
   | ChatRequest
   | { type: 'tool_result'; callId: string; output: string }
   | { type: 'abort'; id: string }
@@ -33,7 +33,8 @@ type Incoming =
 // The library is ESM-only; keep a real dynamic import() under CommonJS output.
 const importEsm = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>
 // DSH_CONTEXT_CAP lets tests reproduce a memory-starved machine.
-const MAX_CONTEXT = Number(process.env.DSH_CONTEXT_CAP) || 8192
+// DSH_CONTEXT_TOKENS is the user's context-size preference (settings → local model).
+const MAX_CONTEXT = Number(process.env.DSH_CONTEXT_TOKENS) || Number(process.env.DSH_CONTEXT_CAP) || 8192
 const MIN_CONTEXT = Math.min(2048, MAX_CONTEXT)
 const THINK_BUDGET_TOKENS = 2048
 /** Below this many tokens the full tool list + agent prompt would eat most of the context. */
@@ -112,7 +113,7 @@ async function probe(): Promise<void> {
   })
 }
 
-async function load(modelPath: string): Promise<void> {
+async function load(modelPath: string, gpuLayers?: number): Promise<void> {
   lib = await importEsm('node-llama-cpp')
   const fileName = path.basename(modelPath)
   if (/(^|[-_.])draft([-_.]|$)/i.test(fileName)) {
@@ -130,10 +131,13 @@ async function load(modelPath: string): Promise<void> {
   }
 
   // Offload as many layers as leave room for the context; if even that does not fit, run on the CPU.
-  const attempts: Record<string, unknown>[] = [
-    { gpuLayers: { fitContext: { contextSize: GPU_FIT_CONTEXT } } },
-    { gpuLayers: 0 },
-  ]
+  // A user-specified layer count (settings → local model) takes precedence: first as given, then CPU.
+  const attempts: Record<string, unknown>[] = gpuLayers !== undefined
+    ? [{ gpuLayers }, { gpuLayers: 0 }]
+    : [
+        { gpuLayers: { fitContext: { contextSize: GPU_FIT_CONTEXT } } },
+        { gpuLayers: 0 },
+      ]
   let lastError: unknown
   for (const options of attempts) {
     try {
@@ -328,7 +332,7 @@ process.on('message', (msg: Incoming) => {
   if (msg.type === 'probe') {
     probe().catch((err) => post({ type: 'error', error: err instanceof Error ? err.message : String(err) }))
   } else if (msg.type === 'load') {
-    load(msg.modelPath).catch((err) => {
+    load(msg.modelPath, msg.gpuLayers).catch((err) => {
       log(`load failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`)
       post({ type: 'error', error: err instanceof Error ? err.message : String(err) })
     })

@@ -21,6 +21,7 @@ import type { LLMProvider, ProviderKind, Message, ChatChunk } from '../renderer/
 import { encrypt, decrypt, generateKey, isValidKey } from './secureStore'
 import { runLocalModel } from './localHf'
 import { GgufEngine } from './gguf'
+import { DEFAULT_MODELS } from '../renderer/lib/cloudModels'
 import { registerModelIpc, isGgufModelId } from './ipcModels'
 import { registerAgentIpc, isPermissionMode, validWorkspace } from './ipcAgent'
 import { HfAuth, type StoredAuth } from './hfAuth'
@@ -34,6 +35,7 @@ import { buildProfile } from '../renderer/lib/modelProfile'
 type StoredProvider = {
   id: string; name: string; kind: ProviderKind
   apiKey?: string; baseUrl?: string; defaultModel?: string
+  customModels?: string[]
   enabled: boolean; local?: boolean
 }
 
@@ -42,14 +44,14 @@ const PROVIDER_KINDS: ProviderKind[] = ['openai-compatible', 'anthropic', 'googl
 function oai(id: string, name: string, baseUrl: string, defaultModel: string) {
   providerRegistry.register(id, new OpenAICompatibleProvider({ id, name, kind: 'openai-compatible', baseUrl, defaultModel, enabled: true }))
 }
-oai('deepseek', 'DeepSeek', 'https://api.deepseek.com/v1', 'deepseek-chat')
-oai('openai', 'OpenAI', 'https://api.openai.com/v1', 'gpt-4o-mini')
-oai('groq', 'Groq', 'https://api.groq.com/openai/v1', 'llama-3.1-70b-versatile')
-oai('together', 'Together AI', 'https://api.together.xyz/v1', 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo')
-oai('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', 'deepseek/deepseek-chat')
-providerRegistry.register('anthropic', new AnthropicProvider({ id: 'anthropic', name: 'Anthropic', kind: 'anthropic', defaultModel: 'claude-3-5-sonnet-20241022', enabled: true }))
-providerRegistry.register('google', new GoogleProvider({ id: 'google', name: 'Google', kind: 'google', defaultModel: 'gemini-1.5-flash', enabled: true }))
-providerRegistry.register('huggingface-api', new HuggingFaceProvider({ id: 'huggingface-api', name: 'Hugging Face (API)', kind: 'huggingface-api', defaultModel: 'meta-llama/Meta-Llama-3.1-8B-Instruct', enabled: true }))
+oai('deepseek', 'DeepSeek', 'https://api.deepseek.com/v1', DEFAULT_MODELS.deepseek)
+oai('openai', 'OpenAI', 'https://api.openai.com/v1', DEFAULT_MODELS.openai)
+oai('groq', 'Groq', 'https://api.groq.com/openai/v1', DEFAULT_MODELS.groq)
+oai('together', 'Together AI', 'https://api.together.xyz/v1', DEFAULT_MODELS.together)
+oai('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', DEFAULT_MODELS.openrouter)
+providerRegistry.register('anthropic', new AnthropicProvider({ id: 'anthropic', name: 'Anthropic', kind: 'anthropic', defaultModel: DEFAULT_MODELS.anthropic, enabled: true }))
+providerRegistry.register('google', new GoogleProvider({ id: 'google', name: 'Google', kind: 'google', defaultModel: DEFAULT_MODELS.google, enabled: true }))
+providerRegistry.register('huggingface-api', new HuggingFaceProvider({ id: 'huggingface-api', name: 'Hugging Face (API)', kind: 'huggingface-api', defaultModel: DEFAULT_MODELS['huggingface-api'], enabled: true }))
 providerRegistry.register('huggingface-local', new HuggingFaceProvider({ id: 'huggingface-local', name: 'Hugging Face (Local)', kind: 'huggingface-local', local: true, defaultModel: 'Xenova/llama2.c-stories15M', enabled: true }))
 
 /** Built-in provider by id, or an instance created from a user-defined config. */
@@ -315,14 +317,17 @@ function parseProvider(raw: any): StoredProvider {
   return {
     id, name, kind: raw.kind,
     apiKey: str(raw.apiKey, 500), baseUrl, defaultModel: str(raw.defaultModel, 200),
+    customModels: Array.isArray(raw.customModels)
+      ? raw.customModels.filter((m: unknown): m is string => typeof m === 'string' && m.trim().length > 0).map((m: string) => m.trim().slice(0, 200)).slice(0, 100)
+      : undefined,
     enabled: raw.enabled !== false,
     ...(raw.local === true || raw.kind === 'huggingface-local' ? { local: true } : {}),
   }
 }
 
 // ---- settings persistence --------------------------------------------------
-type Settings = { apiKey?: string; baseUrl?: string; model?: string; temperature?: number; maxTokens?: number; theme?: 'light' | 'dark'; fontSize?: number; workspace?: string; permissionMode?: PermissionMode }
-const DEFAULT_SETTINGS: Settings = { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', temperature: 0.7, maxTokens: 4096, theme: 'dark', fontSize: 14, permissionMode: 'workspace-auto' }
+type Settings = { apiKey?: string; baseUrl?: string; model?: string; temperature?: number; maxTokens?: number; theme?: 'light' | 'dark'; fontSize?: number; workspace?: string; permissionMode?: PermissionMode; gguf?: { contextTokens?: number; gpuLayers?: number | 'auto' } }
+const DEFAULT_SETTINGS: Settings = { baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-pro', temperature: 0.7, maxTokens: 4096, theme: 'dark', fontSize: 14, permissionMode: 'workspace-auto' }
 const DEEPSEEK_ID = 'deepseek'
 
 function readSettingsFile(): Settings {
@@ -344,7 +349,7 @@ function writeSettingsFile(settings: Settings) {
 async function setDeepseekKey(apiKey: string | undefined): Promise<void> {
   await mutateProviders((list) => {
     const idx = list.findIndex((p) => p.id === DEEPSEEK_ID)
-    const base: StoredProvider = idx >= 0 ? list[idx] : { id: DEEPSEEK_ID, name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-chat', enabled: true }
+    const base: StoredProvider = idx >= 0 ? list[idx] : { id: DEEPSEEK_ID, name: 'DeepSeek', kind: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', defaultModel: 'deepseek-v4-pro', enabled: true }
     const next = { ...base, apiKey }
     return { list: idx >= 0 ? list.map((p, i) => (i === idx ? next : p)) : [...list, next], result: undefined }
   })
@@ -377,6 +382,12 @@ async function saveSettings(raw: any): Promise<Settings> {
     ...(raw?.fontSize !== undefined ? { fontSize: Math.round(clamp(raw.fontSize, 8, 32, 14)) } : {}),
     ...(raw && 'workspace' in raw ? { workspace: validWorkspace(raw.workspace) ?? undefined } : {}),
     ...(isPermissionMode(raw?.permissionMode) ? { permissionMode: raw.permissionMode } : {}),
+    ...(raw?.gguf && typeof raw.gguf === 'object' ? {
+      gguf: {
+        ...(raw.gguf.contextTokens !== undefined ? { contextTokens: Math.round(clamp(raw.gguf.contextTokens, 512, 262144, 8192)) } : {}),
+        ...(raw.gguf.gpuLayers !== undefined ? { gpuLayers: raw.gguf.gpuLayers === 'auto' ? 'auto' as const : Math.round(clamp(raw.gguf.gpuLayers, 0, 999, 0)) } : {}),
+      },
+    } : {}),
   }
   writeSettingsFile(next)
   if (raw && 'apiKey' in raw) await setDeepseekKey(str(raw.apiKey, 500))
@@ -412,8 +423,14 @@ ipcMain.handle('providers:listModels', async (_e, providerId: string) => {
     id: provider.id, name: provider.name, kind: provider.kind,
     apiKey: cfg?.apiKey, baseUrl: cfg?.baseUrl, defaultModel: cfg?.defaultModel, enabled: cfg?.enabled !== false,
   })
+  // Models the user added by hand: always shown, even if the API does not list them.
+  const known = new Set(models.map((m) => m.id))
+  const custom = (cfg?.customModels ?? [])
+    .filter((id) => !known.has(id))
+    .map((id) => ({ id, name: id, provider: provider.id, kind: provider.kind, contextWindow: undefined as number | undefined, profile: undefined }))
+  const merged: Array<{ id: string; name: string; provider: string; kind: ProviderKind; contextWindow?: number; profile?: unknown }> = [...models, ...custom]
   if (provider.kind !== 'huggingface-local') {
-    return models.map((m) => ({ ...m, profile: m.profile ?? buildProfile({ id: m.id, runtime: 'cloud', contextLength: m.contextWindow }) }))
+    return merged.map((m) => ({ ...m, profile: m.profile ?? buildProfile({ id: m.id, runtime: 'cloud', contextLength: m.contextWindow }) }))
   }
   // Only models that are on disk can be chatted with; others are fetched on the models page.
   return (await modelIpc.listLocalModels()).map((m) => ({ id: m.id, name: m.name, provider: provider.id, kind: provider.kind, local: true, downloaded: true, profile: m.profile }))
@@ -476,7 +493,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
   const provider = resolveProvider(cfg)
   if (!provider) throw new Error(`Provider ${req.providerId} not found`)
   const apiKey = cfg.apiKey || (cfg.kind === 'huggingface-api' ? (await hfAuth.getToken()) ?? undefined : undefined)
-  const providerConfig = { id: cfg.id, name: cfg.name, kind: cfg.kind, enabled: true, apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel }
+  const providerConfig = { id: cfg.id, name: cfg.name, kind: cfg.kind, enabled: true, apiKey, baseUrl: cfg.baseUrl, defaultModel: cfg.defaultModel, customModels: cfg.customModels }
 
   const controller = new AbortController()
   activeStreams.set(req.signalId, controller)
@@ -502,6 +519,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
           const messages = [{ role: 'system' as const, content: buildSystemPrompt(workspace) }, ...req.messages]
           for await (const e of ggufEngine.chat({
             modelPath: ggufPath, messages, tools: toolDefs(), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal,
+            contextTokens: settings.gguf?.contextTokens, gpuLayers: settings.gguf?.gpuLayers,
             runTool: (call) => executeTool(call.name, call.arguments, ctx), summarize: summarizeCall,
           })) { sendEvent(e); if (e.type === 'error') break }
         } else {
@@ -511,7 +529,7 @@ ipcMain.handle('chat:stream', async (event, raw) => {
         ctx.remote.closeAll()
       }
     } else if (ggufPath) {
-      for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: withLanguagePrompt(req.messages), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal })) {
+      for await (const e of ggufEngine.chat({ modelPath: ggufPath, messages: withLanguagePrompt(req.messages), thinking: req.thinking, temperature: req.temperature, maxTokens: req.maxTokens, signal: controller.signal, contextTokens: settings.gguf?.contextTokens, gpuLayers: settings.gguf?.gpuLayers })) {
         sendEvent(e)
         if (e.type === 'error') break
       }

@@ -26,6 +26,10 @@ export type GgufChatOptions = {
   temperature: number
   maxTokens: number
   signal: AbortSignal
+  /** Context window override (tokens); the worker still backs off if memory is short. */
+  contextTokens?: number
+  /** Fixed GPU layer count, or 'auto' (default) to fit by free VRAM. */
+  gpuLayers?: number | 'auto'
   /** Executes a tool behind the permission gate; supplied by the caller in agent mode. */
   runTool?: (call: ToolCall) => Promise<ToolResult>
   summarize?: (call: ToolCall) => string
@@ -46,6 +50,7 @@ type WorkerMessage = {
 
 type Entry = {
   modelPath: string
+  engineOpts: string
   child: ChildProcess
   ready: Promise<{ contextSize: number; gpu: string }>
   /** Last stderr output, kept to explain an unexpected exit. */
@@ -79,10 +84,12 @@ export class GgufEngine {
     try { fs.appendFileSync(this.logPath, `[${new Date().toISOString()}] ${text}\n`) } catch { /* logging must never break chat */ }
   }
 
-  private start(modelPath: string): Entry {
+  private start(modelPath: string, engineOpts: { contextTokens?: number; gpuLayers?: number | 'auto' }): Entry {
+    // Engine options change how the model is loaded: a change must reload it.
+    const optsKey = JSON.stringify(engineOpts ?? {})
     // ELECTRON_RUN_AS_NODE makes the Electron binary behave as plain Node for this child.
     const child = fork(this.workerPath, [], {
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ...(engineOpts?.contextTokens ? { DSH_CONTEXT_TOKENS: String(engineOpts.contextTokens) } : {}) },
       execArgv: [],
       stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
     })
@@ -104,8 +111,8 @@ export class GgufEngine {
     })
     ready.catch(() => this.unload(child))
     child.once('exit', () => { if (this.entry?.child === child) this.entry = null })
-    child.send({ type: 'load', modelPath })
-    return { modelPath, child, ready, stderr }
+    child.send({ type: 'load', modelPath, ...(engineOpts?.gpuLayers !== undefined && engineOpts.gpuLayers !== 'auto' ? { gpuLayers: engineOpts.gpuLayers } : {}) })
+    return { modelPath, engineOpts: optsKey, child, ready, stderr }
   }
 
   private unload(child: ChildProcess) {
@@ -114,12 +121,14 @@ export class GgufEngine {
     if (this.entry?.child === child) this.entry = null
   }
 
-  private acquire(modelPath: string): Entry {
+  private acquire(modelPath: string, engineOpts: { contextTokens?: number; gpuLayers?: number | 'auto' }): Entry {
+    const optsKey = JSON.stringify(engineOpts ?? {})
     if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null }
-    if (this.entry && (this.entry.modelPath !== modelPath || this.entry.child.exitCode !== null || !this.entry.child.connected)) {
+    // Reload when the model file or the engine options (context/GPU layers) changed.
+    if (this.entry && (this.entry.modelPath !== modelPath || this.entry.engineOpts !== optsKey || this.entry.child.exitCode !== null || !this.entry.child.connected)) {
       this.unload(this.entry.child)
     }
-    this.entry ??= this.start(modelPath)
+    this.entry ??= this.start(modelPath, engineOpts)
     return this.entry
   }
 
@@ -167,7 +176,7 @@ export class GgufEngine {
   }
 
   async *chat(opts: GgufChatOptions): AsyncGenerator<AgentEvent> {
-    const entry = this.acquire(opts.modelPath)
+    const entry = this.acquire(opts.modelPath, { contextTokens: opts.contextTokens, gpuLayers: opts.gpuLayers })
     try {
       await entry.ready
     } catch (err) {
